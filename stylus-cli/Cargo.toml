@@ -1,0 +1,12 @@
+[package]
+name = "stylus-cli"
+version = { workspace = true }
+edition = { workspace = true }
+
+[[bin]]
+name = "stylus-cli"
+path = "src/main.rs"
+
+[dependencies]
+stylus = { path = "../stylus", version = "0.1.0" }
+clap = { workspace = true }
