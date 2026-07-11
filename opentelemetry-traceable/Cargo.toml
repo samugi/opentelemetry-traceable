@@ -1,0 +1,32 @@
+[package]
+name = "opentelemetry-traceable"
+version = { workspace = true }
+edition = { workspace = true }
+
+# dependencies, sorted alphabetically
+[dependencies]
+arc-swap = { workspace = true }
+linkme = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-traceable-macros = { path = "../opentelemetry-traceable-macros", version = "0.1.0" }
+smallvec = { workspace = true }
+
+# dev dependencies, sorted alphabetically
+[dev-dependencies]
+criterion = { workspace = true }
+opentelemetry-traceable = { path = ".", features = ["otlp"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[bench]]
+name = "traceable_overhead"
+harness = false
+
+[features]
+default = []
+sdk  = ["dep:opentelemetry_sdk"]
+otlp = ["dep:opentelemetry-otlp", "sdk"]

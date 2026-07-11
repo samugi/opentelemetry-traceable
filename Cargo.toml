@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["opentelemetry-traceable", "opentelemetry-traceable-macros"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
+linkme = "0.3"
+opentelemetry = { version = "0.32", features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", features = ["trace", "testing"] }
+opentelemetry-otlp = "0.32"
+tokio = { version = "1", features = ["full"] }
+arc-swap = "1"
+smallvec = "1"
+criterion = "0.5"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tracing-opentelemetry = "0.33"

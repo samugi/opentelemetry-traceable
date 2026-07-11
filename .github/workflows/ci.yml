@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  pull_request: {}
+  workflow_dispatch: {}
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  rust-fmt:
+    name: Run rustfmt checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Run rustfmt
+        run: cargo fmt --all -- --check
+
+  rust-clippy:
+    name: Run clippy checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Run clippy
+        run: >-
+          cargo clippy --locked --workspace --all-targets --all-features --
+          -D warnings
+          -W missing_debug_implementations
+          -W missing_docs
+          -W unsafe_code
+          -W clippy::undocumented_unsafe_blocks
+
+  rust-doc:
+    name: Run rustdoc checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run rustdoc
+        run: cargo doc --locked --workspace --keep-going --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  rust-test:
+    name: Build and run tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install mise (and cargo-nextest via mise)
+        uses: jdx/mise-action@v2
+        with:
+          install: true
+
+      - name: Run cargo build
+        run: cargo build --locked --workspace
+
+      - name: Run cargo nextest (with mise)
+        run: mise run test

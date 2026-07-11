@@ -1,0 +1,13 @@
+[tools]
+"cargo:cargo-nextest" = { version = "0.9.108" }
+
+[tasks.test]
+description = "Run all tests using cargo-nextest"
+run = "cargo nextest run --locked --workspace"
+
+[tasks.lint]
+description = "Run fmt and clippy checks"
+run = [
+    "cargo fmt --all -- --check",
+    "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings",
+]
