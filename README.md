@@ -134,6 +134,37 @@ introspect any particular application's registry. To get the list of functions y
 application actually knows about (and their ids) for a human or LLM to pick from, call
 `stylus::schema::schema_json()` from within that application, as described above.
 
+## Convention: commit a schema file, don't assume a command
+
+`stylus-cli` can never dump an application's schema itself — the `{name, id}` registry only
+exists inside the memory of a specific compiled binary that actually has `#[traceable]`
+functions linked into it (that's the whole reason `stylus::schema::schema_json()` is a library
+call the app makes itself, not a `stylus-cli` subcommand). Rather than standardizing on some
+fixed CLI invocation and hoping every app's binary happens to support it the same way, the
+convention is simpler and more robust: **commit the schema as a JSON file in the repo** (e.g.
+`stylus-schema.json` at the root — see `stylus-demo`'s copy), produced once via
+`stylus::schema::schema_json()` from within the app however that app chooses to expose it, and
+regenerated whenever its `#[traceable]` functions change.
+
+A coding agent reconfiguring tracing should look for this committed file first. If it isn't
+there, or isn't easy to find, it should **ask the user to produce one** (using their app's own
+`stylus::schema::schema_json()`) and provide it — not guess a command and run it unprompted.
+
+## For coding agents: `agents/AGENTS.md` and `agents/SKILL.md`
+
+Two copy-paste templates for any application built on `stylus`, so a coding agent (asked
+something like "trace the database" or "turn off tracing") can reconfigure it using *only*
+`stylus-cli encode` — no bespoke scripts, no reading this whole README.
+
+- `agents/AGENTS.md` → copy to the application repo's root as `AGENTS.md`.
+- `agents/SKILL.md` → copy to the application repo as a manually-invoked Claude Code skill, e.g.
+  `.claude/skills/configure-tracing/SKILL.md`.
+
+Both expect a schema JSON file to already be committed in the repo (per the convention above).
+If it's missing or not obviously located, they ask the user to produce and provide one, rather
+than trying to generate it themselves. See `stylus-demo/AGENTS.md` and
+`stylus-demo/.claude/skills/configure-tracing/SKILL.md` for a working copy.
+
 ## Crate layout
 
 - `stylus` — runtime: `#[traceable]` re-export, `registry` (the `linkme`-collected
