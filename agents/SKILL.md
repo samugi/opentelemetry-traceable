@@ -28,10 +28,10 @@ editing one file.
    This is the only tool you need, and it only does one thing (`encode`).
 
    **Shortcut for "enable/disable everything":** if `args` asks for tracing to be turned on for
-   everything, or off entirely, skip straight to it — no schema lookup, no picking functions.
-   Enable everything with `stylus-cli encode --all`, then go to step 5. Disable everything by
-   setting the config field to an empty string in step 5 — no blob needed. Otherwise, continue
-   below.
+   everything, or off entirely, skip straight to it — no schema lookup, no picking functions,
+   no ancestor walk. Enable everything with `stylus-cli encode --all`, then go to step 6.
+   Disable everything by setting the config field to an empty string in step 6 — no blob
+   needed. Otherwise, continue below.
 
 2. **Get the schema.** You need a JSON file mapping every `#[traceable]` function in this app
    to an id. Expect it to already exist in this repo (common names: `stylus-schema.json`,
@@ -51,22 +51,39 @@ editing one file.
    relevant source to find every function actually called along that path — a name filter
    alone won't capture that.
 
-4. **Generate the blob**:
+4. **Include enabled ancestors, to keep the trace hierarchy intact.** For every function
+   selected in step 3, also find whatever calls it — directly or transitively, all the way up
+   to wherever that chain starts (a top-level flow/entry point, another module, etc.) — by
+   reading the source. If a caller is itself `#[traceable]`, add it to the selection too, and
+   repeat for *its* callers, and so on up the chain.
+
+   Why this matters: disabling a function doesn't just skip its own span, it also leaves the
+   ambient trace context untouched (documented `stylus` behavior). So if a traced function's
+   real caller isn't *also* traced, the child's span shows up as a disconnected root span
+   instead of properly nested under its actual caller — you lose the ability to see where the
+   call came from. Including the full traceable ancestor chain avoids that without merging or
+   splitting any spans: each function still gets exactly its own span, just correctly parented.
+
+   This only applies when *enabling* — disabling a function doesn't break hierarchy the same
+   way, so skip this step for disable requests.
+
+5. **Generate the blob**:
 
    ```
    stylus-cli encode --ids <id1> <id2> ...
    ```
 
-   (or `--names <name1> ...` if working from names instead of ids)
+   (or `--names <name1> ...` if working from names instead of ids) — using the full selection
+   from steps 3 and 4 combined.
 
-5. **Update the local config.** Find the local YAML/JSON config file holding the enabled blob
+6. **Update the local config.** Find the local YAML/JSON config file holding the enabled blob
    — commonly `config.yaml`/`config.json` at the repo root, under a key like
    `tracing.enabled_blob`. **If it isn't obviously the right file/field, ask the user which one
-   to update.** Set that field to the blob from step 4 and save. This replaces whatever was
+   to update.** Set that field to the blob from step 5 and save. This replaces whatever was
    previously enabled — if asked to _add_ to what's currently on, include the
    previously-enabled functions in this selection too. To disable tracing entirely, set the
    field to an empty string instead of generating a blob.
 
-6. **Report tersely.** Just confirm tracing was turned on/off for the requested domain, or that
+7. **Report tersely.** Just confirm tracing was turned on/off for the requested domain, or that
    it failed and why. Nothing else — no function list, no mechanism explanation, no unsolicited
    follow-up.
