@@ -191,23 +191,27 @@ fn set_enabled_replaces_the_active_subset() {
     assert_eq!(spans[0].name, "custom.span");
 }
 
-// Guard against the registry entries themselves being visible / non-empty,
-// which would indicate the linkme-based discovery mechanism isn't wiring up.
+// Registration happens at compile time (the linkme-collected static lives
+// inside each function's body), not on first call -- so every traceable fn
+// should show up here even without being invoked in this test.
 #[test]
 fn registry_discovers_all_traceable_functions_in_this_binary() {
     setup();
-    // Touch every traceable fn once so its local static is linked in.
-    let _ = plain(0);
-    named();
-    let _ = with_fields(String::new());
-    parent();
-    Widget.render();
 
     let names: std::collections::HashSet<_> = stylus::config::all_names().collect();
     assert!(names.contains("custom.span"));
     assert!(names.contains("nesting::parent"));
     assert!(names.contains("nesting::child"));
     assert!(names.contains("widget::render"));
+}
+
+#[test]
+fn enabled_names_reflects_the_active_subset() {
+    setup();
+    stylus::config::enable(["nesting::parent", "nesting::child"]);
+
+    let enabled: std::collections::HashSet<_> = stylus::config::enabled_names().collect();
+    assert_eq!(enabled, ["nesting::parent", "nesting::child"].into());
 }
 
 #[test]

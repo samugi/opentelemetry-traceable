@@ -69,6 +69,14 @@ pub fn all_names() -> impl Iterator<Item = &'static str> {
     REGISTRY.iter().map(|site| site.name)
 }
 
+/// Registry keys that are currently enabled.
+pub fn enabled_names() -> impl Iterator<Item = &'static str> {
+    REGISTRY
+        .iter()
+        .filter(|site| site.enabled.load(Ordering::Relaxed))
+        .map(|site| site.name)
+}
+
 /// Replace the active set from a blob produced by [`crate::subset::encode`]/
 /// [`crate::subset::encode_ids`] (see [`set_enabled`] for exact-name
 /// semantics; this is the same, decoded from a compact blob instead).
