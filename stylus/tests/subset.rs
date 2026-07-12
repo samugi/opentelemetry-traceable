@@ -102,3 +102,31 @@ fn empty_subset_matches_nothing() {
         assert!(!subset::contains(&blob, name).unwrap());
     }
 }
+
+#[test]
+fn encode_all_matches_every_name_in_a_large_universe() {
+    let universe = universe();
+    let blob = subset::encode_all();
+
+    for name in &universe {
+        assert!(
+            subset::contains(&blob, name).unwrap(),
+            "expected `{name}` to match the all-blob, but it didn't"
+        );
+    }
+    // And arbitrary names never registered anywhere, since it's an
+    // unconditional match, not a lookup against a known set.
+    for name in ["totally-unregistered", "some::random::path", ""] {
+        assert!(subset::contains(&blob, name).unwrap());
+    }
+}
+
+#[test]
+fn encode_all_is_tiny() {
+    let blob = subset::encode_all();
+    assert!(
+        blob.len() < 20,
+        "expected the all-blob to be tiny, got {} chars: {blob}",
+        blob.len()
+    );
+}

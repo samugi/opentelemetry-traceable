@@ -162,6 +162,25 @@ pub fn encode_ids(ids: impl IntoIterator<Item = u64>, false_positive_rate: f64) 
     build(&ids, false_positive_rate)
 }
 
+/// A blob that matches every id -- for "enable/disable everything" without
+/// enumerating every function's id. Takes no false-positive rate: there's
+/// nothing to tune, it's deterministically "always a member".
+///
+/// A Bloom filter with every bit set is unconditionally a superset of
+/// everything: for any id, whatever bit position `(h1 + i*h2) % m` computes
+/// to, that bit is already `1` by construction. So this is just the
+/// smallest possible valid blob (`m = 8`, `k = 1`, one all-ones byte) --
+/// no special-casing needed anywhere it's consumed (`decode`, `contains_id`,
+/// `stylus::config::set_enabled_encoded`/`enable_encoded`/`disable_encoded`
+/// all just treat it as an ordinary blob that happens to match everything).
+pub fn encode_all() -> String {
+    let mut blob = Vec::with_capacity(6);
+    blob.extend_from_slice(&8u32.to_le_bytes());
+    blob.push(1u8);
+    blob.push(0xFF);
+    URL_SAFE_NO_PAD.encode(blob)
+}
+
 /// Whether `name` is a member of the subset encoded in `blob` -- exposed
 /// standalone (not just via `stylus::config`) so a blob can be inspected or
 /// tested against a synthetic set of names, without touching the real

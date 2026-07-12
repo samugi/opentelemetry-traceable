@@ -31,16 +31,24 @@ enum Command {
     /// about (and their ids) for a human or LLM to pick from, call
     /// `stylus::schema::schema_json()` from within that application.
     Encode {
-        /// Registry names to enable (mutually exclusive with --ids).
-        #[arg(long, num_args = 1.., conflicts_with = "ids")]
+        /// Registry names to enable (mutually exclusive with --ids/--all).
+        #[arg(long, num_args = 1.., conflicts_with_all = ["ids", "all"])]
         names: Option<Vec<String>>,
 
         /// Precomputed ids to enable, e.g. read from a schema dump
-        /// (mutually exclusive with --names).
-        #[arg(long, num_args = 1.., conflicts_with = "names")]
+        /// (mutually exclusive with --names/--all).
+        #[arg(long, num_args = 1.., conflicts_with_all = ["names", "all"])]
         ids: Option<Vec<u64>>,
 
-        /// Target false-positive rate for the Bloom filter.
+        /// Match every function, without listing any names/ids -- for
+        /// "enable/disable everything" (mutually exclusive with
+        /// --names/--ids).
+        #[arg(long, conflicts_with_all = ["names", "ids"])]
+        all: bool,
+
+        /// Target false-positive rate for the Bloom filter. Ignored with
+        /// --all (there's nothing to tune -- it's deterministically a
+        /// match for everything).
         #[arg(long, default_value_t = 0.01)]
         fp_rate: f64,
     },
@@ -51,13 +59,15 @@ fn main() {
     let Command::Encode {
         names,
         ids,
+        all,
         fp_rate,
     } = cli.command;
 
-    let blob = match (names, ids) {
-        (Some(names), None) => subset::encode(names.iter().map(String::as_str), fp_rate),
-        (None, Some(ids)) => subset::encode_ids(ids, fp_rate),
-        (None, None) => {
+    let blob = match (names, ids, all) {
+        (_, _, true) => subset::encode_all(),
+        (Some(names), None, false) => subset::encode(names.iter().map(String::as_str), fp_rate),
+        (None, Some(ids), false) => subset::encode_ids(ids, fp_rate),
+        (None, None, false) => {
             let mut input = String::new();
             io::stdin()
                 .read_to_string(&mut input)
@@ -69,7 +79,9 @@ fn main() {
                 .collect();
             subset::encode(names, fp_rate)
         }
-        (Some(_), Some(_)) => unreachable!("clap enforces --names/--ids are mutually exclusive"),
+        (Some(_), Some(_), false) => {
+            unreachable!("clap enforces --names/--ids are mutually exclusive")
+        }
     };
     println!("{blob}");
 }

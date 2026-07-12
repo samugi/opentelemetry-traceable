@@ -70,6 +70,13 @@ tunable chance of **false positives** (a handful of *other* functions also end u
 you need exact behavior with no false positives at all, don't use this — build up the active
 set with the exact-name functions above instead.
 
+To enable (or disable) *everything* without enumerating every id, use
+`stylus::subset::encode_all()` instead of `encode`/`encode_ids`: a Bloom filter with every bit
+set matches any id unconditionally, so it's just the smallest possible valid blob (~13 base64
+chars) that happens to be a superset of the whole registry — no new code path, no sentinel
+value, it flows through `set_enabled_encoded`/`enable_encoded`/`disable_encoded` exactly like
+any other blob.
+
 ## Letting an LLM (or a script) configure an arbitrary subset
 
 This is the intended workflow when the thing picking which functions to trace has source
@@ -126,13 +133,14 @@ A standalone binary for turning a name or id list into a blob without writing an
 ```
 stylus-cli encode --names my_crate::process kafka.fetch [--fp-rate 0.01]
 stylus-cli encode --ids 11212198487925888491 4108071546255015497 [--fp-rate 0.01]
+stylus-cli encode --all   # match every function, no names/ids needed
 ```
 
-Reads from stdin (one entry per line) if no values are given as arguments. Prints the base64
-blob to stdout. It's standalone — it only hashes/encodes what it's given; it has no way to
-introspect any particular application's registry. To get the list of functions your
-application actually knows about (and their ids) for a human or LLM to pick from, call
-`stylus::schema::schema_json()` from within that application, as described above.
+Reads from stdin (one entry per line) if no values are given as arguments (and neither `--all`
+is passed). Prints the base64 blob to stdout. It's standalone — it only hashes/encodes what
+it's given; it has no way to introspect any particular application's registry. To get the list
+of functions your application actually knows about (and their ids) for a human or LLM to pick
+from, call `stylus::schema::schema_json()` from within that application, as described above.
 
 ## Convention: commit a schema file, don't assume a command
 

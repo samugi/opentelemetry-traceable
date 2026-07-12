@@ -74,3 +74,23 @@ fn names_and_ids_are_mutually_exclusive() {
     assert_eq!(code, 2);
     assert!(stderr.contains("cannot be used with"));
 }
+
+#[test]
+fn encode_all_prints_a_blob_that_matches_anything() {
+    let (stdout, _stderr, code) = run(&["encode", "--all"], None);
+    assert_eq!(code, 0);
+    let blob = stdout.trim();
+    assert!(!blob.is_empty());
+    assert!(stylus::subset::contains(blob, "totally-unregistered-name").unwrap());
+}
+
+#[test]
+fn all_conflicts_with_names_and_ids() {
+    let (_stdout, stderr, code) = run(&["encode", "--names", "a", "--all"], None);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("cannot be used with"));
+
+    let (_stdout, stderr, code) = run(&["encode", "--ids", "1", "--all"], None);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("cannot be used with"));
+}

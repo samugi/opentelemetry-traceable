@@ -3,17 +3,35 @@ name: configure-tracing
 description: Turn stylus tracing on or off for a subset of this app's functions, described in plain English (e.g. "trace the database", "trace the payment gateway", "turn off tracing"). Manually invoked -- run explicitly when asked to change what's traced.
 ---
 
+> **Written for:** `stylus` @ `main` (this repo has no tagged releases yet — `main` is the only
+> version, and it can gain new flags at any time). This skill assumes `stylus-cli encode`
+> supports `--names`, `--ids`, `--all`, and `--fp-rate`. If `stylus-cli encode --help` doesn't
+> list one of those, this file or your installed `stylus-cli` is stale — re-fetch this file
+> from https://github.com/samugi/stylus (`agents/SKILL.md`) and reinstall `stylus-cli` (step 1)
+> before continuing.
+
 This application uses `stylus` for dynamic, per-function tracing: any `#[traceable]` function
 can be turned on/off at runtime by editing a local config file. `args` is the request in plain
 English (e.g. "trace the database"). Follow this procedure exactly. Do not write a new script
 and do not improvise a different mechanism — everything needed is `stylus-cli encode` plus
 editing one file.
 
-1. **Make sure `stylus-cli` is installed.** Check `stylus-cli --version` first. If missing:
+1. **Make sure `stylus-cli` is installed and up to date.** Because `main` is the only version
+   and it moves, don't just check whether `stylus-cli` is already installed and skip if so —
+   that can leave you silently stuck with a stale build missing newer flags (like `--all`).
+   Always (re)install:
+
    ```
-   cargo install --git git@github.com:samugi/stylus.git stylus-cli
+   cargo install --git ssh://git@github.com/samugi/stylus.git stylus-cli --force
    ```
+
    This is the only tool you need, and it only does one thing (`encode`).
+
+   **Shortcut for "enable/disable everything":** if `args` asks for tracing to be turned on for
+   everything, or off entirely, skip straight to it — no schema lookup, no picking functions.
+   Enable everything with `stylus-cli encode --all`, then go to step 5. Disable everything by
+   setting the config field to an empty string in step 5 — no blob needed. Otherwise, continue
+   below.
 
 2. **Get the schema.** You need a JSON file mapping every `#[traceable]` function in this app
    to an id. Expect it to already exist in this repo (common names: `stylus-schema.json`,
@@ -34,16 +52,18 @@ editing one file.
    alone won't capture that.
 
 4. **Generate the blob**:
+
    ```
    stylus-cli encode --ids <id1> <id2> ...
    ```
+
    (or `--names <name1> ...` if working from names instead of ids)
 
 5. **Update the local config.** Find the local YAML/JSON config file holding the enabled blob
    — commonly `config.yaml`/`config.json` at the repo root, under a key like
    `tracing.enabled_blob`. **If it isn't obviously the right file/field, ask the user which one
    to update.** Set that field to the blob from step 4 and save. This replaces whatever was
-   previously enabled — if asked to *add* to what's currently on, include the
+   previously enabled — if asked to _add_ to what's currently on, include the
    previously-enabled functions in this selection too. To disable tracing entirely, set the
    field to an empty string instead of generating a blob.
 
