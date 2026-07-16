@@ -271,7 +271,7 @@ fn set_enabled_encoded_rejects_a_corrupt_blob() {
 }
 
 #[test]
-fn schema_reports_every_traceable_function_with_a_matching_id() {
+fn catalog_reports_every_traceable_function_with_a_matching_id() {
     setup();
     // Touch every traceable fn once so its local static is linked in.
     let _ = plain(0);
@@ -280,11 +280,11 @@ fn schema_reports_every_traceable_function_with_a_matching_id() {
     parent();
     Widget.render();
 
-    let schema = stylus::schema::schema();
+    let catalog = stylus::catalog::catalog();
     let by_name: std::collections::HashMap<_, _> =
-        schema.functions.iter().map(|f| (f.name, f.id)).collect();
+        catalog.functions.iter().map(|f| (f.name, f.id)).collect();
 
-    assert_eq!(schema.hash, "fnv1a64");
+    assert_eq!(catalog.hash, "fnv1a64");
     for name in [
         "custom.span",
         "nesting::parent",
@@ -294,10 +294,10 @@ fn schema_reports_every_traceable_function_with_a_matching_id() {
         assert_eq!(by_name[name], stylus::subset::id_of(name));
     }
 
-    // schema_json() must be well-formed JSON containing the same data.
-    let json = stylus::schema::schema_json();
+    // catalog_json() must be well-formed JSON containing the same data.
+    let json = stylus::catalog::catalog_json();
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert!(parsed["functions"].as_array().unwrap().len() >= schema.functions.len());
+    assert!(parsed["functions"].as_array().unwrap().len() >= catalog.functions.len());
 }
 
 #[test]
@@ -373,11 +373,11 @@ async fn child_only_works_for_async_functions_too() {
 }
 
 #[test]
-fn schema_reports_child_only_correctly() {
+fn catalog_reports_child_only_correctly() {
     setup();
 
-    let schema = stylus::schema::schema();
-    let by_name: std::collections::HashMap<_, _> = schema
+    let catalog = stylus::catalog::catalog();
+    let by_name: std::collections::HashMap<_, _> = catalog
         .functions
         .iter()
         .map(|f| (f.name, f.child_only))

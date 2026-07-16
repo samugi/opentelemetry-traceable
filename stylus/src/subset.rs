@@ -15,12 +15,12 @@
 //! # Reproducing this without Rust
 //!
 //! Everything below is intentionally simple enough to reimplement from a short
-//! script in any language, given [`crate::schema::schema_json`]'s `{name, id}`
+//! script in any language, given [`crate::catalog::catalog_json`]'s `{name, id}`
 //! list:
 //!
 //! 1. **Hash**: 64-bit FNV-1a over the name's UTF-8 bytes (offset basis
 //!    `0xcbf29ce484222325`, prime `0x100000001b3`). This is the `id` in the
-//!    schema -- [`id_of`] is exactly this.
+//!    catalog -- [`id_of`] is exactly this.
 //! 2. **Sizing**: given `n` items to encode and a target false-positive rate
 //!    `p`, `m = ceil(-n * ln(p) / ln(2)^2)` bits, `k = round((m / n) * ln(2))`
 //!    hash rounds.
@@ -39,7 +39,7 @@ const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// The 64-bit FNV-1a hash of `name` -- the same `id` used internally by
-/// [`encode`]/[`encode_ids`] and reported by [`crate::schema::schema`].
+/// [`encode`]/[`encode_ids`] and reported by [`crate::catalog::catalog`].
 pub fn id_of(name: &str) -> u64 {
     let mut hash = FNV_OFFSET_BASIS;
     for byte in name.as_bytes() {
@@ -156,7 +156,7 @@ pub fn encode<'a>(names: impl IntoIterator<Item = &'a str>, false_positive_rate:
 }
 
 /// Same as [`encode`], but starting from already-computed ids (e.g. read
-/// directly from [`crate::schema::schema`] instead of hashing names again).
+/// directly from [`crate::catalog::catalog`] instead of hashing names again).
 pub fn encode_ids(ids: impl IntoIterator<Item = u64>, false_positive_rate: f64) -> String {
     let ids: Vec<u64> = ids.into_iter().collect();
     build(&ids, false_positive_rate)

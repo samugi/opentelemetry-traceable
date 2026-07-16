@@ -5,7 +5,7 @@
 //! This tool only hashes/encodes what it's given; it has no access to any
 //! particular application's registry. To find out which functions an
 //! application actually knows about (and their ids), call
-//! `stylus::schema::schema_json()` *from within that application* -- see the
+//! `stylus::catalog::catalog_json()` *from within that application* -- see the
 //! repo README for the full workflow.
 
 use std::io::{self, Read};
@@ -29,13 +29,13 @@ enum Command {
     /// given. This tool is standalone: it only hashes/encodes what it's
     /// given. To get the list of functions an application actually knows
     /// about (and their ids) for a human or LLM to pick from, call
-    /// `stylus::schema::schema_json()` from within that application.
+    /// `stylus::catalog::catalog_json()` from within that application.
     Encode {
         /// Registry names to enable (mutually exclusive with --ids/--all).
         #[arg(long, num_args = 1.., conflicts_with_all = ["ids", "all"])]
         names: Option<Vec<String>>,
 
-        /// Precomputed ids to enable, e.g. read from a schema dump
+        /// Precomputed ids to enable, e.g. read from a catalog dump
         /// (mutually exclusive with --names/--all).
         #[arg(long, num_args = 1.., conflicts_with_all = ["names", "all"])]
         ids: Option<Vec<u64>>,

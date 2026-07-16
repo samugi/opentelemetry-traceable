@@ -4,7 +4,7 @@
 //! This is what lets a consumer *without* running Rust -- an LLM with source
 //! access, a script, an operator -- independently pick a subset and build the
 //! exact blob [`crate::config::set_enabled_encoded`] expects: read this
-//! schema, pick functions by name or id, and either call
+//! catalog, pick functions by name or id, and either call
 //! [`crate::subset::encode`]/[`crate::subset::encode_ids`], or hand the
 //! chosen names/ids to `stylus-cli encode`.
 //!
@@ -18,7 +18,7 @@ use crate::registry::REGISTRY;
 use crate::subset::id_of;
 
 /// A single `#[traceable]` function's registry key and id, as reported by
-/// [`schema`].
+/// [`catalog`].
 #[derive(Debug, Serialize)]
 pub struct FunctionEntry {
     /// The registry key -- what `stylus::config`'s exact-name functions
@@ -38,9 +38,9 @@ pub struct FunctionEntry {
 
 /// Every `#[traceable]` function linked into the current binary, plus the
 /// hash/index details needed to reconstruct a [`crate::subset`] blob without
-/// this crate. See [`schema`].
+/// this crate. See [`catalog`].
 #[derive(Debug, Serialize)]
-pub struct Schema {
+pub struct Catalog {
     /// Name of the hash function `id` is computed with.
     pub hash: &'static str,
     /// The formula used to turn an id into a Bloom filter bit index, spelled
@@ -52,8 +52,8 @@ pub struct Schema {
 }
 
 /// Every `#[traceable]` function linked into the current binary, with its id.
-pub fn schema() -> Schema {
-    Schema {
+pub fn catalog() -> Catalog {
+    Catalog {
         hash: "fnv1a64",
         index_formula: "let h1 = id as u32; let h2 = (id >> 32) as u32; idx_i = h1.wrapping_add(i * h2) % m, for i in 0..k",
         functions: REGISTRY
@@ -67,7 +67,7 @@ pub fn schema() -> Schema {
     }
 }
 
-/// [`schema`], serialized as pretty-printed JSON.
-pub fn schema_json() -> String {
-    serde_json::to_string_pretty(&schema()).expect("Schema serialization is infallible")
+/// [`catalog`], serialized as pretty-printed JSON.
+pub fn catalog_json() -> String {
+    serde_json::to_string_pretty(&catalog()).expect("Catalog serialization is infallible")
 }

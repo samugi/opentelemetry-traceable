@@ -104,11 +104,11 @@ This is the intended workflow when the thing picking which functions to trace ha
 access but isn't running Rust, or is choosing from thousands of candidates and can't
 reasonably be handed a plain name list:
 
-1. **Dump the schema.** From within your instrumented application (an admin endpoint, a debug
+1. **Dump the catalog.** From within your instrumented application (an admin endpoint, a debug
    CLI flag, a one-off example — `stylus` has no way to know how *your* app wants to expose
    this, so it just provides the data):
    ```rust
-   let json = stylus::schema::schema_json();
+   let json = stylus::catalog::catalog_json();
    ```
    This returns every `#[traceable]` function currently linked into the binary, each with the
    same 64-bit id `stylus::subset` uses internally:
@@ -135,10 +135,10 @@ reasonably be handed a plain name list:
 
 ### The encoding, if you need to reproduce it without this crate
 
-Simple enough to reimplement in a short script, given a schema dump's `{name, id}` list:
+Simple enough to reimplement in a short script, given a catalog dump's `{name, id}` list:
 
 1. **Hash**: 64-bit FNV-1a over the name's UTF-8 bytes (offset basis `0xcbf29ce484222325`,
-   prime `0x100000001b3`) — this is the `id` in the schema.
+   prime `0x100000001b3`) — this is the `id` in the catalog.
 2. **Sizing**: for `n` items at target false-positive rate `p`:
    `m = ceil(-n * ln(p) / ln(2)^2)` bits, `k = round((m / n) * ln(2))` hash rounds.
 3. **Bit positions**: `h1 = id as u32`, `h2 = (id >> 32) as u32`. For `i` in `0..k`:
@@ -161,23 +161,23 @@ Reads from stdin (one entry per line) if no values are given as arguments (and n
 is passed). Prints the base64 blob to stdout. It's standalone — it only hashes/encodes what
 it's given; it has no way to introspect any particular application's registry. To get the list
 of functions your application actually knows about (and their ids) for a human or LLM to pick
-from, call `stylus::schema::schema_json()` from within that application, as described above.
+from, call `stylus::catalog::catalog_json()` from within that application, as described above.
 
-## Convention: commit a schema file, don't assume a command
+## Convention: commit a catalog file, don't assume a command
 
-`stylus-cli` can never dump an application's schema itself — the `{name, id}` registry only
+`stylus-cli` can never dump an application's catalog itself — the `{name, id}` registry only
 exists inside the memory of a specific compiled binary that actually has `#[traceable]`
-functions linked into it (that's the whole reason `stylus::schema::schema_json()` is a library
+functions linked into it (that's the whole reason `stylus::catalog::catalog_json()` is a library
 call the app makes itself, not a `stylus-cli` subcommand). Rather than standardizing on some
 fixed CLI invocation and hoping every app's binary happens to support it the same way, the
-convention is simpler and more robust: **commit the schema as a JSON file in the repo** (e.g.
-`stylus-schema.json` at the root — see `stylus-demo`'s copy), produced once via
-`stylus::schema::schema_json()` from within the app however that app chooses to expose it, and
+convention is simpler and more robust: **commit the catalog as a JSON file in the repo** (e.g.
+`stylus-catalog.json` at the root — see `stylus-demo`'s copy), produced once via
+`stylus::catalog::catalog_json()` from within the app however that app chooses to expose it, and
 regenerated whenever its `#[traceable]` functions change.
 
 A coding agent reconfiguring tracing should look for this committed file first. If it isn't
 there, or isn't easy to find, it should **ask the user to produce one** (using their app's own
-`stylus::schema::schema_json()`) and provide it — not guess a command and run it unprompted.
+`stylus::catalog::catalog_json()`) and provide it — not guess a command and run it unprompted.
 
 ## For coding agents: `agents/AGENTS.md` and `agents/SKILL.md`
 
@@ -189,7 +189,7 @@ something like "trace the database" or "turn off tracing") can reconfigure it us
 - `agents/SKILL.md` → copy to the application repo as a manually-invoked Claude Code skill, e.g.
   `.claude/skills/configure-tracing/SKILL.md`.
 
-Both expect a schema JSON file to already be committed in the repo (per the convention above).
+Both expect a catalog JSON file to already be committed in the repo (per the convention above).
 If it's missing or not obviously located, they ask the user to produce and provide one, rather
 than trying to generate it themselves. See `stylus-demo/AGENTS.md` and
 `stylus-demo/.claude/skills/configure-tracing/SKILL.md` for a working copy.
@@ -198,7 +198,7 @@ than trying to generate it themselves. See `stylus-demo/AGENTS.md` and
 
 - `stylus` — runtime: `#[traceable]` re-export, `registry` (the `linkme`-collected
   `TraceSite`/`REGISTRY`), `config` (enable/disable, exact and encoded), `subset` (Bloom filter
-  encode/decode), `schema` (the `{name, id}` dump).
+  encode/decode), `catalog` (the `{name, id}` dump).
 - `stylus-macros` — the `#[traceable]` proc-macro implementation.
 - `stylus-cli` — the standalone `encode` binary described above (built with `clap`).
 

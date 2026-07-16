@@ -4,9 +4,9 @@
 //! at runtime — individually, in bulk, or as an arbitrary custom subset —
 //! via [`config`], without recompiling.
 
+pub mod catalog;
 pub mod config;
 pub mod registry;
-pub mod schema;
 pub mod subset;
 
 pub use stylus_macros::traceable;
