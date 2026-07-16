@@ -32,6 +32,11 @@ fn traceable_fn(n: u64) -> u64 {
     workload(n)
 }
 
+#[traceable(child_only)]
+fn traceable_child_only_fn(n: u64) -> u64 {
+    workload(n)
+}
+
 const WORKLOAD_ITERATIONS: u64 = 1_000;
 
 fn bench_traceable_overhead(c: &mut Criterion) {
@@ -45,6 +50,9 @@ fn bench_traceable_overhead(c: &mut Criterion) {
     group.bench_function("traceable_disabled", |b| {
         b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
     });
+    group.bench_function("traceable_disabled_child_only", |b| {
+        b.iter(|| traceable_child_only_fn(black_box(WORKLOAD_ITERATIONS)));
+    });
 
     // A real (if in-process) exporter, so the "enabled" number reflects
     // actual span construction + export cost rather than a no-op global
@@ -57,6 +65,9 @@ fn bench_traceable_overhead(c: &mut Criterion) {
     stylus::config::enable_all();
     group.bench_function("traceable_enabled", |b| {
         b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
+    });
+    group.bench_function("traceable_enabled_child_only", |b| {
+        b.iter(|| traceable_child_only_fn(black_box(WORKLOAD_ITERATIONS)));
     });
 
     group.finish();

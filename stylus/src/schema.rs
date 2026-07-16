@@ -27,6 +27,13 @@ pub struct FunctionEntry {
     /// `subset::id_of(name)` -- the 64-bit FNV-1a digest fed into the Bloom
     /// filter's bit-position formula.
     pub id: u64,
+    /// Whether this function was declared `#[traceable(child_only)]` -- it
+    /// only ever produces a span when called from within an already-active
+    /// span, never as a root, even when enabled. Functions shared across
+    /// multiple call paths are commonly marked this way to avoid orphan
+    /// root spans on paths that aren't (yet) traced; enabling one is only
+    /// useful alongside an enabled ancestor somewhere up its call chain.
+    pub child_only: bool,
 }
 
 /// Every `#[traceable]` function linked into the current binary, plus the
@@ -54,6 +61,7 @@ pub fn schema() -> Schema {
             .map(|site| FunctionEntry {
                 name: site.name,
                 id: id_of(site.name),
+                child_only: site.child_only,
             })
             .collect(),
     }

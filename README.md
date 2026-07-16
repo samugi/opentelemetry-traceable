@@ -33,6 +33,27 @@ Registry key (the string you enable/disable by) defaults to `module_path!() + ":
 or the `name` argument if given. Note this isn't qualified by a surrounding `impl` type — two
 methods with the same name in the same module share a key unless `name` disambiguates them.
 
+## Avoiding orphan spans for functions shared across call paths
+
+A function's `enabled` flag is global — it fires for *every* caller, not just the one you had
+in mind. That's fine for a function with one call site, but a function shared across multiple
+call paths (a common `db`/`cache`/logging-style helper called from several different flows)
+will also fire — as a disconnected root span — every time some *other*, non-traced path calls
+it too, since disabling doesn't touch the ambient context and there's nothing above it to
+attach to.
+
+```rust
+#[traceable(child_only)]
+fn shared_helper() { /* ... */ }
+```
+
+`child_only` additionally requires an already-active (recording) span before creating one of
+its own — never a root, even when enabled. Combined with enabling the right ancestor for the
+path you actually care about, this keeps shared functions correctly nested on that path while
+staying silent (not orphaned) on every other path that also happens to call them. It only
+changes when a span gets created, not whether it does when conditions are met: still zero
+false negatives on the path you enabled, still the same near-zero cost when off.
+
 ## Configuring what's enabled
 
 ```rust
@@ -96,8 +117,8 @@ reasonably be handed a plain name list:
      "hash": "fnv1a64",
      "index_formula": "let h1 = id as u32; let h2 = (id >> 32) as u32; idx_i = h1.wrapping_add(i * h2) % m, for i in 0..k",
      "functions": [
-       { "name": "my_crate::process", "id": 11212198487925888491 },
-       { "name": "kafka.fetch", "id": 4108071546255015497 }
+       { "name": "my_crate::process", "id": 11212198487925888491, "child_only": false },
+       { "name": "kafka.fetch", "id": 4108071546255015497, "child_only": true }
      ]
    }
    ```

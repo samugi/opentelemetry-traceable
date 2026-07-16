@@ -67,6 +67,12 @@ editing one file.
    This only applies when *enabling* — disabling a function doesn't break hierarchy the same
    way, so skip this step for disable requests.
 
+   Check the schema's `child_only` field while you do this: a function with
+   `"child_only": true` *only* creates a span when called from within an already-active span
+   — never as a root, even when its own flag is enabled. For these, the ancestor walk isn't
+   optional: enable a `child_only` function without an enabled ancestor above it and it will
+   silently produce no span at all.
+
 5. **Generate the blob**:
 
    ```

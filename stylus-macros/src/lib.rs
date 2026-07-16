@@ -52,6 +52,7 @@ struct TraceableArgs {
     name: Option<LitStr>,
     tracer: Option<LitStr>,
     fields: Option<Vec<Field>>,
+    child_only: bool,
 }
 
 impl Parse for TraceableArgs {
@@ -82,6 +83,15 @@ impl Parse for TraceableArgs {
                     if args.fields.replace(parsed.into_iter().collect()).is_some() {
                         return Err(syn::Error::new(ident.span(), "duplicate `fields` argument"));
                     }
+                }
+                "child_only" => {
+                    if args.child_only {
+                        return Err(syn::Error::new(
+                            ident.span(),
+                            "duplicate `child_only` argument",
+                        ));
+                    }
+                    args.child_only = true;
                 }
                 other => {
                     return Err(syn::Error::new(
@@ -117,6 +127,13 @@ impl Parse for TraceableArgs {
 ///
 /// #[traceable(fields("component" = "proxy", request_id = id))]
 /// async fn handle(id: String) { }
+///
+/// // Only ever creates a span when called from within an already-active
+/// // (recording) span -- never as a root, even when enabled. For functions
+/// // shared across multiple call paths, this avoids orphan root spans
+/// // whenever some *other*, non-traced path also happens to call them.
+/// #[traceable(child_only)]
+/// fn shared_helper() { }
 /// ```
 #[proc_macro_attribute]
 pub fn traceable(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -187,14 +204,33 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
         }
     };
 
+    let site_ctor = if args.child_only {
+        quote! { ::stylus::registry::TraceSite::new_child_only(#registry_key) }
+    } else {
+        quote! { ::stylus::registry::TraceSite::new(#registry_key) }
+    };
+
+    let disabled_check = if args.child_only {
+        quote! {
+            !__STYLUS_SITE.enabled.load(::std::sync::atomic::Ordering::Relaxed)
+                || !<::opentelemetry::Context as ::opentelemetry::trace::TraceContextExt>::span(
+                    &::opentelemetry::Context::current(),
+                )
+                .is_recording()
+        }
+    } else {
+        quote! {
+            !__STYLUS_SITE.enabled.load(::std::sync::atomic::Ordering::Relaxed)
+        }
+    };
+
     quote! {
         #(#attrs)*
         #vis #sig {
             #[::linkme::distributed_slice(::stylus::registry::REGISTRY)]
-            static __STYLUS_SITE: ::stylus::registry::TraceSite =
-                ::stylus::registry::TraceSite::new(#registry_key);
+            static __STYLUS_SITE: ::stylus::registry::TraceSite = #site_ctor;
 
-            if !__STYLUS_SITE.enabled.load(::std::sync::atomic::Ordering::Relaxed) {
+            if #disabled_check {
                 #block
             } else {
                 #enabled_branch

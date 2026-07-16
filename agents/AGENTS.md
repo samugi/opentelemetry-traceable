@@ -73,6 +73,12 @@ splitting any spans: each function still gets exactly its own span, just correct
 This only applies when *enabling* — disabling a function doesn't break hierarchy the same way,
 so no ancestor walk is needed for disable requests.
 
+Check the schema's `child_only` field while you do this: a function with `"child_only": true`
+*only* creates a span when it's called from within an already-active span — never as a root,
+even when its own flag is enabled. For these, the ancestor walk isn't optional decoration, it's
+required: enable a `child_only` function without an enabled ancestor above it and it will
+silently produce no span at all.
+
 ## 5. Generate the blob
 
 ```

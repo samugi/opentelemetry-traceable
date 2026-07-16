@@ -44,6 +44,26 @@ fn child() -> u64 {
     7
 }
 
+#[traceable(name = "child_only::root")]
+fn child_only_root() -> u64 {
+    child_only_leaf()
+}
+
+#[traceable(name = "child_only::leaf", child_only)]
+fn child_only_leaf() -> u64 {
+    5
+}
+
+#[traceable(name = "child_only::async_root")]
+async fn child_only_async_root() -> u64 {
+    child_only_async_leaf().await
+}
+
+#[traceable(name = "child_only::async_leaf", child_only)]
+async fn child_only_async_leaf() -> u64 {
+    5
+}
+
 struct Widget;
 
 impl Widget {
@@ -278,4 +298,91 @@ fn schema_reports_every_traceable_function_with_a_matching_id() {
     let json = stylus::schema::schema_json();
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert!(parsed["functions"].as_array().unwrap().len() >= schema.functions.len());
+}
+
+#[test]
+fn child_only_creates_no_span_without_an_active_parent() {
+    let exporter = setup();
+    // Enabled, but called directly with no ambient span -- must stay silent,
+    // not become an orphan root.
+    stylus::config::enable(["child_only::leaf"]);
+
+    let result = child_only_leaf();
+
+    assert_eq!(result, 5);
+    assert!(exporter.get_finished_spans().unwrap().is_empty());
+}
+
+#[test]
+fn child_only_nests_correctly_under_an_active_parent() {
+    let exporter = setup();
+    stylus::config::enable(["child_only::root", "child_only::leaf"]);
+
+    let result = child_only_root();
+
+    assert_eq!(result, 5);
+    let spans = exporter.get_finished_spans().unwrap();
+    assert_eq!(spans.len(), 2);
+    let leaf_span = spans.iter().find(|s| s.name == "child_only::leaf").unwrap();
+    let root_span = spans.iter().find(|s| s.name == "child_only::root").unwrap();
+    assert_eq!(leaf_span.parent_span_id, root_span.span_context.span_id());
+}
+
+#[test]
+fn child_only_stays_disabled_even_with_an_active_parent() {
+    let exporter = setup();
+    // Root enabled, leaf's own flag left off -- child_only only relaxes the
+    // "needs a parent" requirement, it doesn't bypass the function's own
+    // enabled flag.
+    stylus::config::enable(["child_only::root"]);
+
+    let result = child_only_root();
+
+    assert_eq!(result, 5);
+    let spans = exporter.get_finished_spans().unwrap();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].name, "child_only::root");
+}
+
+#[tokio::test]
+async fn child_only_works_for_async_functions_too() {
+    let exporter = setup();
+
+    stylus::config::enable(["child_only::async_leaf"]);
+    let result = child_only_async_leaf().await;
+    assert_eq!(result, 5);
+    assert!(
+        exporter.get_finished_spans().unwrap().is_empty(),
+        "async child_only fn must not orphan without an active parent"
+    );
+
+    stylus::config::enable(["child_only::async_root", "child_only::async_leaf"]);
+    let result = child_only_async_root().await;
+    assert_eq!(result, 5);
+    let spans = exporter.get_finished_spans().unwrap();
+    assert_eq!(spans.len(), 2);
+    let leaf_span = spans
+        .iter()
+        .find(|s| s.name == "child_only::async_leaf")
+        .unwrap();
+    let root_span = spans
+        .iter()
+        .find(|s| s.name == "child_only::async_root")
+        .unwrap();
+    assert_eq!(leaf_span.parent_span_id, root_span.span_context.span_id());
+}
+
+#[test]
+fn schema_reports_child_only_correctly() {
+    setup();
+
+    let schema = stylus::schema::schema();
+    let by_name: std::collections::HashMap<_, _> = schema
+        .functions
+        .iter()
+        .map(|f| (f.name, f.child_only))
+        .collect();
+
+    assert!(by_name["child_only::leaf"]);
+    assert!(!by_name["child_only::root"]);
 }

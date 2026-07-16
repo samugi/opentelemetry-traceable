@@ -11,6 +11,12 @@ pub struct TraceSite {
     pub name: &'static str,
     /// Whether tracing is currently turned on for this function.
     pub enabled: AtomicBool,
+    /// Whether this function only creates a span when called from within an
+    /// already-active (recording) span -- set by `#[traceable(child_only)]`.
+    /// Never a root, even when `enabled`; avoids orphan root spans for
+    /// functions shared across multiple call paths where some paths aren't
+    /// traced.
+    pub child_only: bool,
 }
 
 impl TraceSite {
@@ -19,6 +25,16 @@ impl TraceSite {
         Self {
             name,
             enabled: AtomicBool::new(false),
+            child_only: false,
+        }
+    }
+
+    /// Same as [`TraceSite::new`], but for `#[traceable(child_only)]` sites.
+    pub const fn new_child_only(name: &'static str) -> Self {
+        Self {
+            name,
+            enabled: AtomicBool::new(false),
+            child_only: true,
         }
     }
 }
