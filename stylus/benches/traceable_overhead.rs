@@ -32,11 +32,6 @@ fn traceable_fn(n: u64) -> u64 {
     workload(n)
 }
 
-#[traceable(child_only)]
-fn traceable_child_only_fn(n: u64) -> u64 {
-    workload(n)
-}
-
 const WORKLOAD_ITERATIONS: u64 = 1_000;
 
 fn bench_traceable_overhead(c: &mut Criterion) {
@@ -50,9 +45,6 @@ fn bench_traceable_overhead(c: &mut Criterion) {
     group.bench_function("traceable_disabled", |b| {
         b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
     });
-    group.bench_function("traceable_disabled_child_only", |b| {
-        b.iter(|| traceable_child_only_fn(black_box(WORKLOAD_ITERATIONS)));
-    });
 
     // A real (if in-process) exporter, so the "enabled" number reflects
     // actual span construction + export cost rather than a no-op global
@@ -62,12 +54,20 @@ fn bench_traceable_overhead(c: &mut Criterion) {
         .with_simple_exporter(exporter)
         .build();
     opentelemetry::global::set_tracer_provider(provider);
+
     stylus::config::enable_all();
+    stylus::config::set_child_only([]);
     group.bench_function("traceable_enabled", |b| {
         b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
     });
-    group.bench_function("traceable_enabled_child_only", |b| {
-        b.iter(|| traceable_child_only_fn(black_box(WORKLOAD_ITERATIONS)));
+
+    // Enabled + child-only, called with no active parent: exercises the
+    // child-only gate (extra atomic load + ambient-context check) on the path
+    // where it suppresses the span rather than creating one.
+    let all_names: Vec<&str> = stylus::config::all_names().collect();
+    stylus::config::set_child_only(all_names);
+    group.bench_function("traceable_enabled_child_only_suppressed", |b| {
+        b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
     });
 
     group.finish();

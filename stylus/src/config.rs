@@ -114,3 +114,43 @@ pub fn disable_encoded(blob: &str) -> Result<(), DecodeError> {
     }
     Ok(())
 }
+
+/// Replace the *child-only* set: exactly the given names are put in child-only
+/// mode, every other function is made root-capable again.
+///
+/// A child-only function only produces a span when called from within an
+/// already-recording span -- never as a root, even when enabled. This is
+/// orthogonal to [`set_enabled`]: a function must be enabled to trace at all,
+/// and being child-only additionally suppresses it when it would otherwise be
+/// a root. Whether a shared function should be child-only is request-relative,
+/// so it's decided here rather than at the call site.
+pub fn set_child_only<'a, I: IntoIterator<Item = &'a str>>(names: I) {
+    let wanted: HashSet<&str> = names.into_iter().collect();
+    for site in REGISTRY.iter() {
+        site.child_only
+            .store(wanted.contains(site.name), Ordering::Relaxed);
+    }
+}
+
+/// Replace the child-only set from a blob produced by
+/// [`crate::subset::encode`]/[`crate::subset::encode_ids`] (see
+/// [`set_child_only`] for the semantics; this is the same, decoded from a
+/// compact blob instead).
+pub fn set_child_only_encoded(blob: &str) -> Result<(), DecodeError> {
+    let filter = subset::decode(blob)?;
+    for site in REGISTRY.iter() {
+        site.child_only.store(
+            filter.contains_id(subset::id_of(site.name)),
+            Ordering::Relaxed,
+        );
+    }
+    Ok(())
+}
+
+/// Registry keys currently in child-only mode.
+pub fn child_only_names() -> impl Iterator<Item = &'static str> {
+    REGISTRY
+        .iter()
+        .filter(|site| site.child_only.load(Ordering::Relaxed))
+        .map(|site| site.name)
+}

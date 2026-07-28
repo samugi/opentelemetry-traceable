@@ -4,158 +4,104 @@ description: Turn stylus tracing on or off for a subset of this app's functions,
 ---
 
 > **Written for:** `stylus` @ `main` (this repo has no tagged releases yet — `main` is the only
-> version, and it can gain new flags at any time). This skill assumes `stylus-cli encode`
-> supports `--names`, `--ids`, `--all`, and `--fp-rate`. If `stylus-cli encode --help` doesn't
-> list one of those, this file or your installed `stylus-cli` is stale — re-fetch this file
-> from https://github.com/samugi/stylus (`agents/SKILL.md`) and reinstall `stylus-cli` (step 1)
-> before continuing.
+> version, and it can gain new flags at any time). This skill assumes `stylus-cli` has both an
+> `encode` subcommand (`--names`, `--ids`, `--all`, `--fp-rate`) and a `graph` subcommand
+> (`--catalog`, `--src`). If `stylus-cli --help` doesn't list `graph`, or an `encode` flag is
+> missing, this file or your installed `stylus-cli` is stale — re-fetch it from
+> https://github.com/samugi/stylus (`agents/SKILL.md`) and reinstall `stylus-cli` (step 1).
 
 This application uses `stylus` for dynamic, per-function tracing: any `#[traceable]` function
 can be turned on/off at runtime by editing a local config file. `args` is the request in plain
-English (e.g. "trace the database"). Follow this procedure step by step, in order, and don't
-skip a step because it looks unnecessary. Do not write a new script and do not improvise a
-different mechanism — everything needed is `stylus-cli encode`, `rg`, and editing one file.
-Every step is a fixed, mechanical procedure (a lookup or a pattern match), not something to
-reason about freely.
+English (e.g. "trace the database"). Follow this procedure step by step, in order. Do not write
+a new script or improvise a different mechanism — everything needed is `stylus-cli`, a committed
+call-graph catalog, and editing one config file.
 
-1. **Make sure `stylus-cli` has what this skill needs.** Run `stylus-cli encode --help` (if the
-   command isn't found at all, skip straight to reinstalling below) and check its output lists
-   all four of `--names`, `--ids`, `--all`, `--fp-rate`.
-   - All four present: it's already good, do nothing else here.
-   - Any missing, or the command isn't found: (re)install it:
+The config holds **two** blobs: `enabled_blob` (which functions trace at all) and
+`child_only_blob` (which enabled functions only span when they already have an active parent,
+never as a root — this keeps a shared helper from orphaning on flows you didn't ask to trace).
+You compute both mechanically from the catalog graph: graph traversal plus one membership rule,
+no code comprehension required.
+
+1. **Make sure `stylus-cli` is current.** Run `stylus-cli --help` and confirm it lists both
+   `encode` and `graph`; then `stylus-cli encode --help` and confirm `--names`, `--ids`,
+   `--all`, `--fp-rate`.
+   - All present: continue.
+   - `graph` missing, a flag missing, or the command isn't found: (re)install it:
      ```
      cargo install --git ssh://git@github.com/samugi/stylus.git stylus-cli --force
      ```
-   Checking first instead of always reinstalling is deliberate: reinstalling recompiles from
-   source every time, which is slow and usually unnecessary. The check is what protects you
-   from a stale binary (this repo has no version tags, so "already installed" alone doesn't
-   mean "has the flag you need") — it's just cheaper than a blind reinstall. This is the only
-   tool you need, and it only does one thing (`encode`).
+   Checking first instead of always reinstalling is deliberate: reinstalling recompiles every
+   time (slow, usually unnecessary). The check protects you from a stale binary (no version
+   tags, so "already installed" doesn't mean "has what you need").
 
-   **Shortcut for "enable/disable everything":** if `args` asks for tracing to be turned on for
-   everything, or off entirely, skip straight to it — no catalog lookup, no picking functions,
-   no ancestor walk. Enable everything with `stylus-cli encode --all`, then go to step 6.
-   Disable everything by setting the config field to an empty string in step 6 — no blob
-   needed. Otherwise, continue below.
+   **Shortcut for "enable/disable everything":** if `args` asks to trace everything, set
+   `enabled_blob` to `stylus-cli encode --all` and `child_only_blob` to `""` (step 6) — no
+   catalog needed. To disable everything, set *both* blobs to `""` (step 6). Otherwise continue.
 
-2. **Get the catalog.** You need a JSON file mapping every `#[traceable]` function in this app
-   to an id. Expect it to already exist in this repo (common names: `stylus-catalog.json`,
-   `catalog.json`, often at the repo root or in `docs/`; `grep -rl '"hash": "fnv1a64"' .` finds it
-   if the name isn't obvious).
+2. **Get the call-graph catalog.** You need a JSON catalog of every `#[traceable]` function
+   *with its call-graph edges* (`callers`/`callees` per function) — that's what you traverse.
+   1. Find the committed node dump: a `{name, id}` list, commonly `stylus-catalog.json` /
+      `catalog.json` at the repo root or `docs/` (`grep -rl '"hash": "fnv1a64"' .` finds it).
+      **If there's none, stop and ask the user** to generate it — it comes from the app's own
+      binary (normally `cargo run --quiet -- catalog > stylus-catalog.json`), not something you
+      can produce.
+   2. Check whether its functions have `callers`/`callees`.
+      - They do: use it as-is.
+      - They don't (just `{name, id}`): add them yourself (this only needs the source):
+        ```
+        stylus-cli graph --catalog <node-dump>.json --src ./src > /tmp/stylus-graph.json
+        ```
+        and use `/tmp/stylus-graph.json` from here on.
 
-   **If you can't find one, stop and ask the user** where it is, or ask them to generate it.
-   Don't try to generate it yourself — catalog dumping is specific to this app's own binary
-   (`stylus-cli` can't do it: the registry only exists inside a compiled binary that actually
-   has `#[traceable]` functions linked into it), so producing it is on the user, not you. If
-   useful context, the command is normally `cargo run --quiet -- catalog > stylus-catalog.json`,
-   but confirm rather than assume.
+   The catalog also has an `unresolved_calls` list (calls static analysis couldn't resolve);
+   you only touch it in step 4.
 
-3. **Pick the functions matching `args`.** The catalog's `functions` array has `{name, id}`
-   pairs.
+3. **Build the enabled set `E`** (work in function ids):
+   - **Module/concern** ("trace the database"): `E` = every function whose name contains the
+     module (e.g. `::db::`). Done.
+   - **Flow** ("trace checkout end-to-end"): start at the entry function and walk `callees`
+     transitively — add each callee, and its callees, until nothing new appears.
+   - **Subject you want fully rooted** (e.g. complete traces ending in db calls): also walk
+     `callers` upward from the concern functions — add each caller, and its callers, until
+     nothing new appears. This pulls in the entry points so traces are rooted at real flows
+     rather than dangling. (Including this for a plain "trace the database" never hurts.)
 
-   **Before doing any matching here or in step 4, compute each function's match key** — do
-   this once, for the whole catalog, up front, and reuse it for both steps:
-   - Start each function's key as just its own name's last `::`-separated segment (e.g.
-     `insert` for `stylus_demo::domain::db::orders::insert`).
-   - If any *other* function in the catalog shares that same last segment, the key is
-     ambiguous — extend it by one more segment from the end (e.g. `orders::insert`) and check
-     again. Keep adding segments until it's unique across the whole catalog.
-   - Most functions need only their bare name; only ones with a same-named sibling elsewhere
-     (a common pattern for CRUD-style names like `insert`/`send`/`find_by_id` reused across
-     modules) need more segments. Matching on the bare last segment alone produces false
-     positives whenever two functions share one (searching for plain `insert(` would wrongly
-     credit a function with calling *every* `insert`, not just the one it actually calls) — the
-     match key is exactly enough of the trailing path to tell them apart, and no more.
+4. **Fill gaps near your selection (only if needed).** Scan `unresolved_calls` for entries whose
+   `in_fn` (or `candidates`) are in `E`. For *those only*, open the `site` (`file:line`), read
+   the few surrounding lines, resolve the real target, and add it to `E` if step-3 logic says it
+   belongs (a callee on a traced flow, or a caller you're walking up to). Ignore unresolved
+   calls that don't touch your selection. If `unresolved_calls` is empty, skip this step.
 
-   **Module/concern request** ("trace the database"): match by name substring against the
-   catalog (e.g. everything containing `::db::`). That's the whole step — no source reading.
+5. **Compute the child-only set `CO`** — purely from `E` and the graph:
 
-   **Flow request** ("trace checkout end-to-end"): the entry point plus everything it calls,
-   found by mechanical search, not by reading and understanding the code. Repeat for each
-   function in a work list, starting with just the entry point, until a full pass adds nothing
-   new:
-   1. `rg -n "fn <short_name>"` (the function's own last path segment) to find where it's
-      defined.
-   2. Read only that function's body: from the opening `{` to its matching closing `}`. Don't
-      read anything else in the file.
-   3. For every *other* function in the catalog, check whether `<its match key>(` (not just its
-      bare name) appears as a substring of the body text from step 2.
-   4. Every match is a function this one calls: add its full catalog name to the work list (if
-      not already picked) and to the selection.
-   5. Repeat from step 1 for each newly added function.
+   > **`CO` = every function in `E` that has at least one of its `callers` also in `E`.**
+   > (A function is a *root* if none of its callers are in `E`; every other enabled function is
+   > child-only.)
 
-4. **Include enabled ancestors, to keep the trace hierarchy intact.** For every function
-   selected in step 3 that is **not** marked `"child_only": true` in the catalog, find whatever
-   calls it, by mechanical search, not by reading and understanding the code. This only applies
-   when *enabling*; skip this step entirely for disable requests, since disabling a function
-   doesn't break hierarchy the same way.
+   That's the whole rule. Tracing a flow: the entry roots, everything downstream is child-only,
+   so a shared helper stays silent on the *other* flows that also call it. Tracing a subject
+   with ancestors walked in: the entry points root, subject functions nest under them, and a
+   subject function with no caller in `E` roots (so it still shows, never vanishes).
 
-   **Skip any `child_only` function here — do not walk its callers.** A `child_only` function
-   already only creates a span when some ancestor is actively being traced (that's the entire
-   point of the flag), so it needs no ancestor added on its behalf. Walking its callers anyway
-   would pull in *every* unrelated flow that happens to also call it — e.g. if
-   `analytics::track_event` is `child_only` and called by all 8 scenarios, walking its
-   ancestors for a "trace checkout" request would incorrectly enable the other 7 scenarios too,
-   defeating the whole point of a scoped request. Only non-`child_only` functions in the
-   selection can actually end up as orphan roots, so they're the only ones that need this step.
+   **Cycle guard:** if two functions in `E` call each other, the rule can mark both child-only,
+   leaving that group rootless (nothing spans). After computing `CO`, ensure every connected
+   group in `E` has ≥1 root; if a pure cycle doesn't, drop the requested entry point (or any one
+   cycle node) from `CO`.
 
-   Starting from the non-`child_only` functions in the step-3 selection as a work list, repeat
-   until a full pass adds nothing new (and don't add a `child_only` function's own callers to
-   the work list either, if one gets pulled in some other way):
-   1. Take one function's match key (from step 3 — not just its bare name, to avoid matching
-      some *other* function's call site by mistake) and run `rg -n "<match key>\("` across the
-      whole source tree to find every occurrence.
-   2. Discard any occurrence that's the function's *own definition*, not a call to it —
-      recognize these because `fn` appears immediately before the name (e.g.
-      `pub async fn track_event(`). For every remaining occurrence (a file and line number),
-      scan upward through that same file, line by line, for the nearest line above it matching
-      `fn \w+` (with an optional `pub`/`async` before it) — that is the enclosing (calling)
-      function's definition.
-   3. Take that enclosing function's own last path segment and look it up in the catalog. If
-      exactly one catalog entry ends with that segment, it's traceable: add its full catalog name
-      to the work list (if not already picked) and to the selection. If *more than one* catalog
-      entry shares that segment (rare for calling functions, common for called ones), pick the
-      one whose full name's module path matches the file/directory you found it in (e.g. a
-      function found in `src/domain/db.rs` most likely belongs to a catalog entry containing
-      `::db::`); if it's still ambiguous, ask the user rather than guessing.
-   4. Repeat from step 1 for the next function in the work list.
-
-   Why this matters: disabling a function doesn't just skip its own span, it also leaves the
-   ambient trace context untouched (documented `stylus` behavior). So if a traced function's
-   real caller isn't *also* traced, the child's span shows up as a disconnected root span
-   instead of properly nested under its actual caller — you lose the ability to see where the
-   call came from. Including the full traceable ancestor chain avoids that without merging or
-   splitting any spans: each function still gets exactly its own span, just correctly parented.
-
-   Check the catalog's `child_only` field while you do this: a function with
-   `"child_only": true` *only* creates a span when called from within an already-active span
-   — never as a root, even when its own flag is enabled. For these, the ancestor walk isn't
-   optional: enable a `child_only` function without an enabled ancestor above it and it will
-   silently produce no span at all.
-
-5. **Generate the blob**:
-
+6. **Update the config, then verify.** Generate both blobs:
    ```
-   stylus-cli encode --ids <id1> <id2> ...
+   stylus-cli encode --ids <every id in E>     # -> enabled_blob
+   stylus-cli encode --ids <every id in CO>    # -> child_only_blob
    ```
+   Find the local YAML/JSON config — commonly `config.yaml`/`config.json` at the repo root, with
+   `tracing.enabled_blob` and `tracing.child_only_blob`. **If it isn't obviously the right
+   file/fields, ask the user.** Set both (for a disable request, both `""`). This replaces
+   what's there; to _add_ to what's on, include the previously-enabled ids in `E` too.
 
-   (or `--names <name1> ...` if working from names instead of ids) — using the full selection
-   from steps 3 and 4 combined. This prints a single blob string to stdout — keep it exactly as
-   printed for the next step, don't retype it.
-
-6. **Update the local config, then verify the write.** Find the local YAML/JSON config file
-   holding the enabled blob — commonly `config.yaml`/`config.json` at the repo root, under a
-   key like `tracing.enabled_blob`. **If it isn't obviously the right file/field, ask the user
-   which one to update.** Set that field to the blob from step 5 (or an empty string, if
-   disabling) and save. This replaces whatever was previously enabled — if asked to _add_ to
-   what's currently on, include the previously-enabled functions in this selection too.
-
-   **Then re-read the field you just wrote and compare it, character for character, against the
-   blob step 5 printed.** Don't report success until they match exactly. If they don't, fix the
-   file and check again — a value off by even one character is invalid and silently leaves
-   tracing unchanged (a real, previously-seen failure mode: a single dropped character produces
-   a blob that fails to decode, and the app leaves tracing exactly as it was, with no visible
-   effect at all).
+   **Then re-read both fields and compare them character-for-character against what `encode`
+   printed.** Don't report success until they match exactly. A value off by even one character
+   is invalid and silently leaves tracing unchanged (a real failure mode: one dropped character
+   makes the blob fail to decode, and the app keeps its old state with no visible effect).
 
 7. **Report tersely.** Just confirm tracing was turned on/off for the requested domain, or that
    it failed and why. Nothing else — no function list, no mechanism explanation, no unsolicited

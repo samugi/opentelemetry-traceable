@@ -42,17 +42,27 @@ will also fire — as a disconnected root span — every time some *other*, non-
 it too, since disabling doesn't touch the ambient context and there's nothing above it to
 attach to.
 
+The fix is *child-only mode*: a function in this mode only creates a span when it's called from
+within an already-active (recording) span — never a root, even when enabled.
+
 ```rust
-#[traceable(child_only)]
-fn shared_helper() { /* ... */ }
+stylus::config::set_child_only(["my_crate::shared_helper"]);
+// or from a compact blob, exactly like the enabled set:
+stylus::config::set_child_only_encoded(&blob)?;
 ```
 
-`child_only` additionally requires an already-active (recording) span before creating one of
-its own — never a root, even when enabled. Combined with enabling the right ancestor for the
-path you actually care about, this keeps shared functions correctly nested on that path while
-staying silent (not orphaned) on every other path that also happens to call them. It only
-changes when a span gets created, not whether it does when conditions are met: still zero
-false negatives on the path you enabled, still the same near-zero cost when off.
+Crucially this is **not** a source annotation — it's set at runtime, because whether a shared
+helper *should* root a trace depends on what you're tracing. Tracing the flow that calls it?
+Put it in child-only mode so it stays nested and never orphans on the *other* flows. Tracing
+the helper's own subsystem (e.g. "trace the database")? Leave it root-capable so it still
+produces a trace even when its immediate caller isn't traced. It only changes *when* a span is
+created, not whether — still zero false negatives on the path you enabled, still the same
+near-zero cost when off.
+
+Deciding which functions to put in child-only mode for a given request is mechanical given a
+call graph: a function should be child-only exactly when one of its own callers is also being
+traced (so it always has a parent), and root-capable otherwise. That's what `stylus-cli graph`
+and the agent workflow below automate.
 
 ## Configuring what's enabled
 
@@ -64,6 +74,9 @@ stylus::config::enable_all();
 stylus::config::disable_all();
 stylus::config::is_enabled("kafka.fetch"); // -> bool
 stylus::config::all_names(); // -> every registered key, for introspection
+
+stylus::config::set_child_only(["my_crate::shared_helper"]); // replace the child-only set
+stylus::config::child_only_names(); // -> those currently in child-only mode
 ```
 
 This works fine for a handful of functions. It doesn't scale as a wire format: 100 names out of
@@ -117,11 +130,15 @@ reasonably be handed a plain name list:
      "hash": "fnv1a64",
      "index_formula": "let h1 = id as u32; let h2 = (id >> 32) as u32; idx_i = h1.wrapping_add(i * h2) % m, for i in 0..k",
      "functions": [
-       { "name": "my_crate::process", "id": 11212198487925888491, "child_only": false },
-       { "name": "kafka.fetch", "id": 4108071546255015497, "child_only": true }
+       { "name": "my_crate::process", "id": 11212198487925888491 },
+       { "name": "kafka.fetch", "id": 4108071546255015497 }
      ]
    }
    ```
+   This is the *node* list. Call-graph edges aren't known to the running binary; run
+   `stylus-cli graph` (below) over your source to augment this with `callers`/`callees` per
+   function (plus an `unresolved_calls` worklist) — needed to pick enabled ancestors and
+   child-only functions that keep the trace hierarchy intact.
 2. **Hand that JSON to the consumer** (an LLM with access to your source, a script, an
    operator) along with the task: "pick whichever of these functions should be traced."
 3. **Turn the picks into a blob.** Either in Rust:
@@ -163,6 +180,19 @@ it's given; it has no way to introspect any particular application's registry. T
 of functions your application actually knows about (and their ids) for a human or LLM to pick
 from, call `stylus::catalog::catalog_json()` from within that application, as described above.
 
+It also builds the call graph, by statically parsing your source (no compile, no run):
+
+```
+stylus-cli graph --catalog catalog.json --src ./src
+```
+
+This takes the node dump (from `catalog_json()`) and prints it back with `callers`/`callees`
+per function, resolving direct calls between `#[traceable]` functions by trailing-path match.
+Calls it can't resolve statically — dynamic dispatch, function pointers, macro-generated
+calls — are listed under `unresolved_calls` (a `file:line` worklist) rather than silently
+dropped, so a source-aware agent can fill in just the ones relevant to its request. It's exact
+for direct calls (see the `unresolved_calls` note for the blind spots).
+
 ## Convention: commit a catalog file, don't assume a command
 
 `stylus-cli` can never dump an application's catalog itself — the `{name, id}` registry only
@@ -200,7 +230,8 @@ than trying to generate it themselves. See `stylus-demo/AGENTS.md` and
   `TraceSite`/`REGISTRY`), `config` (enable/disable, exact and encoded), `subset` (Bloom filter
   encode/decode), `catalog` (the `{name, id}` dump).
 - `stylus-macros` — the `#[traceable]` proc-macro implementation.
-- `stylus-cli` — the standalone `encode` binary described above (built with `clap`).
+- `stylus-cli` — the standalone binary described above (built with `clap`): `encode` (names/ids
+  → blob) and `graph` (source → call-graph edges, via `syn`).
 
 ## Benchmarks
 

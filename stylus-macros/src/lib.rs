@@ -52,7 +52,6 @@ struct TraceableArgs {
     name: Option<LitStr>,
     tracer: Option<LitStr>,
     fields: Option<Vec<Field>>,
-    child_only: bool,
 }
 
 impl Parse for TraceableArgs {
@@ -83,15 +82,6 @@ impl Parse for TraceableArgs {
                     if args.fields.replace(parsed.into_iter().collect()).is_some() {
                         return Err(syn::Error::new(ident.span(), "duplicate `fields` argument"));
                     }
-                }
-                "child_only" => {
-                    if args.child_only {
-                        return Err(syn::Error::new(
-                            ident.span(),
-                            "duplicate `child_only` argument",
-                        ));
-                    }
-                    args.child_only = true;
                 }
                 other => {
                     return Err(syn::Error::new(
@@ -127,14 +117,13 @@ impl Parse for TraceableArgs {
 ///
 /// #[traceable(fields("component" = "proxy", request_id = id))]
 /// async fn handle(id: String) { }
-///
-/// // Only ever creates a span when called from within an already-active
-/// // (recording) span -- never as a root, even when enabled. For functions
-/// // shared across multiple call paths, this avoids orphan root spans
-/// // whenever some *other*, non-traced path also happens to call them.
-/// #[traceable(child_only)]
-/// fn shared_helper() { }
 /// ```
+///
+/// Whether a function is allowed to root a trace or is *child-only* (only ever
+/// creates a span when called from within an already-active span, never as a
+/// root) is not a source annotation — it's decided at runtime via
+/// `stylus::config`, since whether a shared function should root a trace
+/// depends on what's being traced.
 #[proc_macro_attribute]
 pub fn traceable(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as TraceableArgs);
@@ -204,31 +193,25 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
         }
     };
 
-    let site_ctor = if args.child_only {
-        quote! { ::stylus::registry::TraceSite::new_child_only(#registry_key) }
-    } else {
-        quote! { ::stylus::registry::TraceSite::new(#registry_key) }
-    };
-
-    let disabled_check = if args.child_only {
-        quote! {
-            !__STYLUS_SITE.enabled.load(::std::sync::atomic::Ordering::Relaxed)
-                || !<::opentelemetry::Context as ::opentelemetry::trace::TraceContextExt>::span(
+    // Skip span creation if disabled, or if in child-only mode with no
+    // already-recording parent span. Short-circuits so the disabled path costs
+    // a single atomic load; the `child_only` load and the context check only
+    // happen once a function is actually enabled.
+    let disabled_check = quote! {
+        !__STYLUS_SITE.enabled.load(::std::sync::atomic::Ordering::Relaxed)
+            || (__STYLUS_SITE.child_only.load(::std::sync::atomic::Ordering::Relaxed)
+                && !<::opentelemetry::Context as ::opentelemetry::trace::TraceContextExt>::span(
                     &::opentelemetry::Context::current(),
                 )
-                .is_recording()
-        }
-    } else {
-        quote! {
-            !__STYLUS_SITE.enabled.load(::std::sync::atomic::Ordering::Relaxed)
-        }
+                .is_recording())
     };
 
     quote! {
         #(#attrs)*
         #vis #sig {
             #[::linkme::distributed_slice(::stylus::registry::REGISTRY)]
-            static __STYLUS_SITE: ::stylus::registry::TraceSite = #site_ctor;
+            static __STYLUS_SITE: ::stylus::registry::TraceSite =
+                ::stylus::registry::TraceSite::new(#registry_key);
 
             if #disabled_check {
                 #block

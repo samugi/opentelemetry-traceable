@@ -11,30 +11,23 @@ pub struct TraceSite {
     pub name: &'static str,
     /// Whether tracing is currently turned on for this function.
     pub enabled: AtomicBool,
-    /// Whether this function only creates a span when called from within an
-    /// already-active (recording) span -- set by `#[traceable(child_only)]`.
-    /// Never a root, even when `enabled`; avoids orphan root spans for
-    /// functions shared across multiple call paths where some paths aren't
-    /// traced.
-    pub child_only: bool,
+    /// Whether this function is in *child-only* mode: it only creates a span
+    /// when called from within an already-active (recording) span -- never as
+    /// a root, even when `enabled`. Set at runtime via `stylus::config` (not a
+    /// source annotation): whether a shared function should be allowed to root
+    /// a trace is request-relative, so this is decided when tracing is
+    /// configured, avoiding orphan root spans on call paths that aren't traced.
+    pub child_only: AtomicBool,
 }
 
 impl TraceSite {
-    /// Creates a new, disabled-by-default registry entry for `name`.
+    /// Creates a new registry entry for `name`, disabled and root-capable by
+    /// default (both `enabled` and `child_only` start `false`).
     pub const fn new(name: &'static str) -> Self {
         Self {
             name,
             enabled: AtomicBool::new(false),
-            child_only: false,
-        }
-    }
-
-    /// Same as [`TraceSite::new`], but for `#[traceable(child_only)]` sites.
-    pub const fn new_child_only(name: &'static str) -> Self {
-        Self {
-            name,
-            enabled: AtomicBool::new(false),
-            child_only: true,
+            child_only: AtomicBool::new(false),
         }
     }
 }

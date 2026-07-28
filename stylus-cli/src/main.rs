@@ -8,7 +8,11 @@
 //! `stylus::catalog::catalog_json()` *from within that application* -- see the
 //! repo README for the full workflow.
 
+mod graph;
+
 use std::io::{self, Read};
+use std::path::PathBuf;
+use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use stylus::subset;
@@ -52,18 +56,52 @@ enum Command {
         #[arg(long, default_value_t = 0.01)]
         fp_rate: f64,
     },
+
+    /// Augment a catalog node dump with call-graph edges by statically
+    /// parsing the application's source (no compile, no run).
+    ///
+    /// Reads the `{name, id}` node list produced by the app's own
+    /// `stylus::catalog::catalog_json()`, resolves direct calls between
+    /// traceable functions from source, and prints the catalog with
+    /// `callers`/`callees` per function plus an `unresolved_calls` worklist
+    /// for calls static analysis can't pin down (dynamic dispatch, macros).
+    Graph {
+        /// Path to the catalog node dump (from `... catalog > catalog.json`).
+        #[arg(long)]
+        catalog: PathBuf,
+
+        /// Root of the application's source tree to scan (e.g. `./src`).
+        #[arg(long)]
+        src: PathBuf,
+    },
 }
 
-fn main() {
-    let cli = Cli::parse();
-    let Command::Encode {
-        names,
-        ids,
-        all,
-        fp_rate,
-    } = cli.command;
+fn main() -> ExitCode {
+    match Cli::parse().command {
+        Command::Encode {
+            names,
+            ids,
+            all,
+            fp_rate,
+        } => {
+            println!("{}", encode(names, ids, all, fp_rate));
+            ExitCode::SUCCESS
+        }
+        Command::Graph { catalog, src } => match graph::run(&catalog, &src) {
+            Ok(json) => {
+                println!("{json}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("stylus-cli graph: {e}");
+                ExitCode::FAILURE
+            }
+        },
+    }
+}
 
-    let blob = match (names, ids, all) {
+fn encode(names: Option<Vec<String>>, ids: Option<Vec<u64>>, all: bool, fp_rate: f64) -> String {
+    match (names, ids, all) {
         (_, _, true) => subset::encode_all(),
         (Some(names), None, false) => subset::encode(names.iter().map(String::as_str), fp_rate),
         (None, Some(ids), false) => subset::encode_ids(ids, fp_rate),
@@ -82,6 +120,5 @@ fn main() {
         (Some(_), Some(_), false) => {
             unreachable!("clap enforces --names/--ids are mutually exclusive")
         }
-    };
-    println!("{blob}");
+    }
 }
