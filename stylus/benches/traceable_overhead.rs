@@ -3,13 +3,30 @@
 //! disabled (the near-zero-cost claim this crate is built around), and a
 //! `#[traceable]` function with tracing enabled (real span creation +
 //! export, so it's not an unrealistically cheap no-op tracer).
+//!
+//! Also compares against a minimal hand-rolled equivalent built on the
+//! `tracing` crate instead: `#[tracing::instrument]` gated by a single
+//! global `AtomicBool`, checked on every call via `tracing_subscriber`'s
+//! `DynFilterFn` (which reports `Interest::sometimes()` rather than letting
+//! `tracing` cache a fixed answer per callsite -- the same "recheck every
+//! call" semantics `stylus` relies on). The "enabled" case is wired through
+//! `tracing-opentelemetry` to the exact same `SdkTracerProvider` and
+//! `InMemorySpanExporter` the `stylus` "enabled" benchmark uses, so both
+//! pay for real span construction and export, not a no-op stub -- an
+//! apples-to-apples comparison rather than a hand-wavy one.
 
 // `criterion_group!` expands to an undocumented public `benches` fn.
 #![allow(missing_docs)]
 
+use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracer, SdkTracerProvider};
 use stylus::traceable;
+use tracing_subscriber::filter::DynFilterFn;
+use tracing_subscriber::prelude::*;
 
 /// Some reasonable, non-trivial CPU-bound work -- an FNV-1a-style mixing
 /// loop -- so the benchmark reflects overhead relative to a real function
@@ -32,6 +49,39 @@ fn traceable_fn(n: u64) -> u64 {
     workload(n)
 }
 
+/// Gate for the `tracing`-based equivalent below -- read on every call via
+/// `DynFilterFn`, mirroring the per-site `AtomicBool` `stylus` checks on
+/// every call in `registry::TraceSite`.
+static TRACING_GATE: AtomicBool = AtomicBool::new(false);
+
+/// Sets the global default `tracing` subscriber once: `tracing_subscriber`'s
+/// `registry()` layered with `tracing-opentelemetry`'s bridge (real span
+/// export via `tracer`, the same kind of `SdkTracer` the `stylus` benchmark
+/// uses), filtered by a `DynFilterFn` reading `TRACING_GATE`. `DynFilterFn`'s
+/// callsite interest is `sometimes()` (it can't assume the closure's answer
+/// is fixed), so the gate is re-evaluated on every call rather than cached
+/// after the first check -- same dynamic-enable semantics as `stylus`.
+fn init_tracing_subscriber(tracer: SdkTracer) {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let filter = DynFilterFn::new(|_metadata, _cx| TRACING_GATE.load(Ordering::Relaxed));
+        let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        let subscriber = tracing_subscriber::registry().with(otel_layer.with_filter(filter));
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("setting the global tracing subscriber for this bench");
+    });
+}
+
+// Default `#[instrument]` behavior also records every argument as a span
+// field (here, `n`) -- `#[traceable]` only does that if `fields(...)` is
+// given explicitly. Left as the default (rather than `skip_all`) since it's
+// how most real `#[instrument]` call sites are written; the number below
+// includes that extra formatting cost, not just the enable/disable check.
+#[tracing::instrument]
+fn tracing_instrument_fn(n: u64) -> u64 {
+    workload(n)
+}
+
 const WORKLOAD_ITERATIONS: u64 = 1_000;
 
 fn bench_traceable_overhead(c: &mut Criterion) {
@@ -48,11 +98,14 @@ fn bench_traceable_overhead(c: &mut Criterion) {
 
     // A real (if in-process) exporter, so the "enabled" number reflects
     // actual span construction + export cost rather than a no-op global
-    // tracer stub.
+    // tracer stub. Shared with the `tracing`-based benchmark below via a
+    // second tracer from the same provider, so both "enabled" numbers pay
+    // for the same real span construction + export work.
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter)
         .build();
+    let tracing_tracer = provider.tracer("tracing_bench");
     opentelemetry::global::set_tracer_provider(provider);
 
     stylus::config::enable_all();
@@ -61,13 +114,16 @@ fn bench_traceable_overhead(c: &mut Criterion) {
         b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
     });
 
-    // Enabled + child-only, called with no active parent: exercises the
-    // child-only gate (extra atomic load + ambient-context check) on the path
-    // where it suppresses the span rather than creating one.
-    let all_names: Vec<&str> = stylus::config::all_names().collect();
-    stylus::config::set_child_only(all_names);
-    group.bench_function("traceable_enabled_child_only_suppressed", |b| {
-        b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
+    init_tracing_subscriber(tracing_tracer);
+
+    TRACING_GATE.store(false, Ordering::Relaxed);
+    group.bench_function("tracing_instrument_disabled", |b| {
+        b.iter(|| tracing_instrument_fn(black_box(WORKLOAD_ITERATIONS)));
+    });
+
+    TRACING_GATE.store(true, Ordering::Relaxed);
+    group.bench_function("tracing_instrument_enabled", |b| {
+        b.iter(|| tracing_instrument_fn(black_box(WORKLOAD_ITERATIONS)));
     });
 
     group.finish();

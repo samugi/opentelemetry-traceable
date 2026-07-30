@@ -15,6 +15,9 @@ serde_json = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 tokio = { workspace = true }
 criterion = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 
 [[bench]]
 name = "traceable_overhead"
