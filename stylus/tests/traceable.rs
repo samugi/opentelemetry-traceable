@@ -1,7 +1,9 @@
 //! Integration tests for `#[traceable]` span creation and dynamic enable/disable.
 
 use opentelemetry::global;
+use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+use stylus::instrumentation::Instrumentation;
 use stylus::traceable;
 
 fn setup() -> InMemorySpanExporter {
@@ -408,4 +410,165 @@ fn child_only_names_reflects_the_configured_set() {
     assert!(names.contains("shared::leaf"));
     assert!(names.contains("shared::async_leaf"));
     assert!(!names.contains("shared::root"));
+}
+
+// --- Multiple, independently-configured instrumentations -------------------
+
+/// Build a named instrumentation with its own in-memory exporter/provider.
+/// The returned exporter observes only that instrumentation's spans; the
+/// tracer keeps its provider alive for the instrumentation's lifetime.
+fn named_instr(name: &'static str) -> (Instrumentation, InMemorySpanExporter) {
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let instr = Instrumentation::builder()
+        .name(name)
+        .tracer(provider.tracer(name))
+        .build()
+        .expect("a free instrumentation slot");
+    (instr, exporter)
+}
+
+#[test]
+fn two_instrumentations_isolate_their_spans_and_traces() {
+    setup();
+    let (a, exp_a) = named_instr("A");
+    let (b, exp_b) = named_instr("B");
+
+    // Overlapping enabled sets: both trace the parent, only A traces the child.
+    a.enable(["nesting::parent", "nesting::child"]);
+    b.enable(["nesting::parent"]);
+
+    let _ = parent();
+
+    let spans_a = exp_a.get_finished_spans().unwrap();
+    let spans_b = exp_b.get_finished_spans().unwrap();
+
+    let names_a: std::collections::HashSet<_> = spans_a.iter().map(|s| s.name.as_ref()).collect();
+    let names_b: std::collections::HashSet<_> = spans_b.iter().map(|s| s.name.as_ref()).collect();
+    assert_eq!(names_a, ["nesting::parent", "nesting::child"].into());
+    assert_eq!(names_b, ["nesting::parent"].into());
+
+    // No trace ID ever crosses between the two exporters.
+    let traces_a: std::collections::HashSet<_> =
+        spans_a.iter().map(|s| s.span_context.trace_id()).collect();
+    let traces_b: std::collections::HashSet<_> =
+        spans_b.iter().map(|s| s.span_context.trace_id()).collect();
+    assert!(traces_a.is_disjoint(&traces_b));
+}
+
+#[test]
+fn each_instrumentation_nests_independently() {
+    setup();
+    let (a, exp_a) = named_instr("A");
+    let (b, exp_b) = named_instr("B");
+
+    // A traces one parent/child pair, B a different one.
+    a.enable(["nesting::parent", "nesting::child"]);
+    b.enable(["shared::root", "shared::leaf"]);
+
+    let _ = parent();
+    let _ = shared_root();
+
+    let sa = exp_a.get_finished_spans().unwrap();
+    assert_eq!(sa.len(), 2, "A sees only its own pair");
+    let ap = sa.iter().find(|s| s.name == "nesting::parent").unwrap();
+    let ac = sa.iter().find(|s| s.name == "nesting::child").unwrap();
+    assert_eq!(ac.parent_span_id, ap.span_context.span_id());
+    assert_eq!(ac.span_context.trace_id(), ap.span_context.trace_id());
+
+    let sb = exp_b.get_finished_spans().unwrap();
+    assert_eq!(sb.len(), 2, "B sees only its own pair");
+    let br = sb.iter().find(|s| s.name == "shared::root").unwrap();
+    let bl = sb.iter().find(|s| s.name == "shared::leaf").unwrap();
+    assert_eq!(bl.parent_span_id, br.span_context.span_id());
+    assert_eq!(bl.span_context.trace_id(), br.span_context.trace_id());
+}
+
+#[test]
+fn default_and_named_coexist_with_independent_traces() {
+    let exp_default = setup();
+    let (named, exp_named) = named_instr("N");
+
+    // The same function enabled in both the default instrumentation and a named
+    // one -- each produces its own span in its own tracer/backend.
+    stylus::config::enable(["nesting::parent"]);
+    named.enable(["nesting::parent"]);
+
+    let _ = parent();
+
+    let sd = exp_default.get_finished_spans().unwrap();
+    let sn = exp_named.get_finished_spans().unwrap();
+    assert_eq!(sd.len(), 1);
+    assert_eq!(sn.len(), 1);
+    assert_eq!(sd[0].name, "nesting::parent");
+    assert_eq!(sn[0].name, "nesting::parent");
+    assert_ne!(
+        sd[0].span_context.trace_id(),
+        sn[0].span_context.trace_id(),
+        "default and named instrumentations build separate traces"
+    );
+}
+
+#[test]
+fn child_only_is_per_instrumentation() {
+    setup();
+    let (a, exp_a) = named_instr("A");
+    let (b, exp_b) = named_instr("B");
+
+    // Both enable the shared leaf; A puts it in child-only mode, B leaves it
+    // root-capable. Called directly (no parent), A must suppress it, B must not.
+    a.enable(["shared::leaf"]);
+    a.set_child_only(["shared::leaf"]);
+    b.enable(["shared::leaf"]);
+
+    let _ = shared_leaf();
+
+    assert!(
+        exp_a.get_finished_spans().unwrap().is_empty(),
+        "A: child-only with no parent stays silent"
+    );
+    let sb = exp_b.get_finished_spans().unwrap();
+    assert_eq!(sb.len(), 1, "B: root-capable, so it roots its own span");
+    assert_eq!(sb[0].name, "shared::leaf");
+}
+
+#[test]
+fn dropping_an_instrumentation_stops_new_spans_and_frees_reuse() {
+    setup();
+    let (a, exp_a) = named_instr("A");
+    a.enable(["nesting::parent"]);
+    let _ = parent();
+    assert_eq!(exp_a.get_finished_spans().unwrap().len(), 1);
+
+    exp_a.reset();
+    drop(a);
+    let _ = parent();
+    assert!(
+        exp_a.get_finished_spans().unwrap().is_empty(),
+        "no new spans for a dropped instrumentation's slot"
+    );
+
+    // A fresh instrumentation still allocates cleanly and works.
+    let (c, exp_c) = named_instr("C");
+    c.enable(["nesting::parent"]);
+    let _ = parent();
+    assert_eq!(exp_c.get_finished_spans().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn named_instrumentation_works_across_await_points() {
+    setup();
+    let (a, exp_a) = named_instr("A");
+    a.enable(["shared::async_root", "shared::async_leaf"]);
+
+    let _ = shared_async_root().await;
+
+    let sa = exp_a.get_finished_spans().unwrap();
+    assert_eq!(sa.len(), 2);
+    let root = sa.iter().find(|s| s.name == "shared::async_root").unwrap();
+    let leaf = sa.iter().find(|s| s.name == "shared::async_leaf").unwrap();
+    assert_eq!(leaf.parent_span_id, root.span_context.span_id());
+    assert_eq!(leaf.span_context.trace_id(), root.span_context.trace_id());
 }

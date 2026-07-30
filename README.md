@@ -83,6 +83,29 @@ This works fine for a handful of functions. It doesn't scale as a wire format: 1
 a 100,000-function registry is 4-6 KB of configuration just to select 0.1% of it. That's what
 the rest of this document is for.
 
+## Multiple parallel instrumentations
+
+Everything above drives the single, always-present **default instrumentation**. On top of it you
+can create named instrumentations at runtime — each with its own enabled subset, its own isolated
+span hierarchy over the same call flow, and its own `Tracer` (potentially a different backend):
+
+```rust
+let checkout = stylus::instrumentation::Instrumentation::builder()
+    .name("checkout-debug")
+    .tracer(provider.tracer("checkout-debug")) // any opentelemetry Tracer
+    .build()?;
+checkout.enable(["my_crate::checkout", "my_crate::db::insert"]);
+// ... same enable/disable/set_child_only/*_encoded API as `stylus::config`, scoped to this handle.
+// Dropping `checkout` stops new spans for it and frees the slot.
+```
+
+The default and each named instrumentation build fully independent traces from the same physical
+call chain. The disabled and default-only fast paths are unchanged — the extra machinery is paid
+only on calls where a named instrumentation is actually active. Up to 64 concurrent
+instrumentations; named ones are in-process only (the default owns downstream `traceparent`
+propagation). See [`docs/multi-instrumentation.md`](docs/multi-instrumentation.md) for the design
+and the measured no-regression numbers.
+
 ## Compact subset encoding
 
 `stylus::subset` encodes an arbitrary selection of functions as a **Bloom filter** instead of a

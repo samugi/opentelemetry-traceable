@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracer, SdkTracerProvider};
+use stylus::instrumentation::Instrumentation;
 use stylus::traceable;
 use tracing_subscriber::filter::DynFilterFn;
 use tracing_subscriber::prelude::*;
@@ -125,6 +126,45 @@ fn bench_traceable_overhead(c: &mut Criterion) {
     group.bench_function("tracing_instrument_enabled", |b| {
         b.iter(|| tracing_instrument_fn(black_box(WORKLOAD_ITERATIONS)));
     });
+
+    // Named instrumentations exercise the multi-slot path (`start_spans` + the
+    // one per-call `Context::with_value` envelope). `traceable_enabled` above is
+    // the default-only (`mask == 1`) path -- the byte-identical-to-before code --
+    // so it doubles as the no-regression reference these are measured against.
+    // Disable the default slot so the mask holds only the named bit(s),
+    // isolating the per-active-slot cost.
+    stylus::config::disable_all();
+
+    let exporter1 = InMemorySpanExporter::default();
+    let provider1 = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter1)
+        .build();
+    let instr1 = Instrumentation::builder()
+        .name("bench-1")
+        .tracer(provider1.tracer("bench-1"))
+        .build()
+        .expect("a free instrumentation slot");
+    instr1.enable_all();
+    group.bench_function("traceable_one_named_instrumentation", |b| {
+        b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
+    });
+
+    let exporter2 = InMemorySpanExporter::default();
+    let provider2 = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter2)
+        .build();
+    let instr2 = Instrumentation::builder()
+        .name("bench-2")
+        .tracer(provider2.tracer("bench-2"))
+        .build()
+        .expect("a free instrumentation slot");
+    instr2.enable_all();
+    group.bench_function("traceable_two_named_instrumentations", |b| {
+        b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
+    });
+
+    drop(instr1);
+    drop(instr2);
 
     group.finish();
 }

@@ -8,6 +8,8 @@ opentelemetry = { workspace = true }
 linkme = { workspace = true }
 stylus-macros = { path = "../stylus-macros", version = "0.1.0" }
 base64 = { workspace = true }
+arc-swap = { workspace = true }
+smallvec = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

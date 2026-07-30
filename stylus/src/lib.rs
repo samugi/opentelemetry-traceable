@@ -6,6 +6,7 @@
 
 pub mod catalog;
 pub mod config;
+pub mod instrumentation;
 pub mod registry;
 pub mod subset;
 

@@ -2,8 +2,9 @@
 //!
 //! Uses an `#[in_span]`-style argument surface (`name`, `tracer`,
 //! `fields(key = expr, ...)`), but additionally gates span creation behind a
-//! per-function `AtomicBool` discovered at link time via `linkme`, so tracing
-//! can be toggled per function at runtime without recompiling.
+//! per-function bitmask discovered at link time via `linkme` (one bit per
+//! `stylus::instrumentation` slot), so tracing can be toggled per function --
+//! and per instrumentation -- at runtime without recompiling.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -156,25 +157,35 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
         None => quote! { ::std::env!("CARGO_PKG_NAME") },
     };
 
-    let span_init = match &args.fields {
-        None => quote! {
-            ::opentelemetry::trace::Tracer::start(&__stylus_tracer, #span_name)
-        },
-        Some(fields) => {
-            let kvs = fields.iter().map(|f| {
+    // The `fields(...)` as `KeyValue` expressions, reused by both the
+    // default-only fast branch and the multi-instrumentation branch.
+    let kvs: Vec<TokenStream2> = match &args.fields {
+        None => Vec::new(),
+        Some(fields) => fields
+            .iter()
+            .map(|f| {
                 let key = &f.key;
                 let value = &f.value;
                 quote! { ::opentelemetry::KeyValue::new(#key, #value) }
-            });
-            quote! {
-                ::opentelemetry::trace::SpanBuilder::from_name(#span_name)
-                    .with_attributes([#(#kvs),*])
-                    .start(&__stylus_tracer)
-            }
+            })
+            .collect(),
+    };
+
+    let span_init = if kvs.is_empty() {
+        quote! { ::opentelemetry::trace::Tracer::start(&__stylus_tracer, #span_name) }
+    } else {
+        quote! {
+            ::opentelemetry::trace::SpanBuilder::from_name(#span_name)
+                .with_attributes([#(#kvs),*])
+                .start(&__stylus_tracer)
         }
     };
 
-    let enabled_branch = if is_async {
+    // The default-only (`mask == 1`) branch is byte-for-byte what stylus has
+    // always generated: one span from the process-global tracer, nested under
+    // the single ambient context. No instrumentation-slot machinery, so
+    // existing callers pay exactly what they always have.
+    let default_enabled_branch = if is_async {
         quote! {
             let __stylus_tracer = ::opentelemetry::global::tracer(#tracer_name);
             let __stylus_span = #span_init;
@@ -193,19 +204,26 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
         }
     };
 
-    // Skip span creation if disabled, or if in child-only mode with no
-    // already-recording parent span. Short-circuits so the disabled path costs
-    // a single atomic load; the `child_only` load and the context check only
-    // happen once a function is actually enabled.
-    let disabled_check = quote! {
-        !__STYLUS_SITE.enabled.load(::std::sync::atomic::Ordering::Relaxed)
-            || (__STYLUS_SITE.child_only.load(::std::sync::atomic::Ordering::Relaxed)
-                && !<::opentelemetry::Context as ::opentelemetry::trace::TraceContextExt>::span(
-                    &::opentelemetry::Context::current(),
-                )
-                .is_recording())
+    // The multi-instrumentation branch: `start_spans` builds one child span per
+    // active slot (with that slot's own tracer/parent) and hands back the single
+    // context to attach, or `None` if every active slot was child-only-suppressed.
+    let multi_wrapped = if is_async {
+        quote! {
+            ::opentelemetry::trace::FutureExt::with_context(async #block, __stylus_cx).await
+        }
+    } else {
+        quote! {
+            let __stylus_guard = __stylus_cx.attach();
+            let __stylus_ret = #block;
+            ::std::mem::drop(__stylus_guard);
+            __stylus_ret
+        }
     };
 
+    // Fast-path dispatch on the enabled bitmask:
+    //   0 -> nobody's tracing; run the body raw (a single atomic load).
+    //   1 -> only the default instrumentation; today's exact code path.
+    //   _ -> at least one named instrumentation is active; go wide.
     quote! {
         #(#attrs)*
         #vis #sig {
@@ -213,10 +231,32 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
             static __STYLUS_SITE: ::stylus::registry::TraceSite =
                 ::stylus::registry::TraceSite::new(#registry_key);
 
-            if #disabled_check {
+            let __stylus_mask =
+                __STYLUS_SITE.enabled_mask.load(::std::sync::atomic::Ordering::Relaxed);
+            if __stylus_mask == 0u64 {
                 #block
+            } else if __stylus_mask == 1u64 {
+                if __STYLUS_SITE.child_only_mask.load(::std::sync::atomic::Ordering::Relaxed) & 1u64 != 0
+                    && !<::opentelemetry::Context as ::opentelemetry::trace::TraceContextExt>::span(
+                        &::opentelemetry::Context::current(),
+                    )
+                    .is_recording()
+                {
+                    #block
+                } else {
+                    #default_enabled_branch
+                }
             } else {
-                #enabled_branch
+                match ::stylus::instrumentation::start_spans(
+                    __stylus_mask,
+                    __STYLUS_SITE.child_only_mask.load(::std::sync::atomic::Ordering::Relaxed),
+                    #span_name,
+                    #tracer_name,
+                    ::std::vec![#(#kvs),*],
+                ) {
+                    ::std::option::Option::None => #block,
+                    ::std::option::Option::Some(__stylus_cx) => { #multi_wrapped }
+                }
             }
         }
     }
