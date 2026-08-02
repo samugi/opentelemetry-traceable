@@ -289,6 +289,11 @@ pub fn start_spans(
     let table = SLOT_TABLE.load();
     let mut slot0_cx: Option<Context> = None;
     let mut created_any = false;
+    // Whether any named slot actually created a span this call. If not, `env` is
+    // identical to the parent's and the default slot's `slot0_cx` already carries
+    // the parent's `MultiInstrumentState` (via `with_span`'s entries clone), so we
+    // can skip re-inserting it and avoid `with_value`'s HashMap clone entirely.
+    let mut env_changed = false;
 
     let mut bits = enabled_mask;
     while bits != 0 {
@@ -321,6 +326,7 @@ pub fn start_spans(
                 None => env.push((slot, child)),
             }
             created_any = true;
+            env_changed = true;
         }
     }
 
@@ -328,10 +334,21 @@ pub fn start_spans(
         return None;
     }
 
+    // No named slot changed the envelope: the only new span is the default slot's,
+    // and its `slot0_cx` already carries the parent's `MultiInstrumentState`. Hand
+    // it back untouched -- no `with_value`, no HashMap clone.
+    if !env_changed {
+        return slot0_cx;
+    }
+
     // One physical context to attach: the default slot's span (if any) in the
-    // fast `.span` slot, the named slots in a single `with_value` envelope.
-    let base_cx = slot0_cx.unwrap_or_else(|| cur.clone());
-    Some(base_cx.with_value(MultiInstrumentState(env)))
+    // fast `.span` slot, the named slots in a single `with_value` envelope. When
+    // no default span was created we insert straight onto `cur` (which we still
+    // own) rather than cloning it first -- `with_value` clones `entries` itself.
+    Some(match slot0_cx {
+        Some(cx) => cx.with_value(MultiInstrumentState(env)),
+        None => cur.with_value(MultiInstrumentState(env)),
+    })
 }
 
 // ---------------------------------------------------------------------------

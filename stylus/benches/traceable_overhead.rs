@@ -93,7 +93,7 @@ fn bench_traceable_overhead(c: &mut Criterion) {
     });
 
     stylus::config::disable_all();
-    group.bench_function("traceable_disabled", |b| {
+    group.bench_function("traceable_disa", |b| {
         b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
     });
 
@@ -111,19 +111,19 @@ fn bench_traceable_overhead(c: &mut Criterion) {
 
     stylus::config::enable_all();
     stylus::config::set_child_only([]);
-    group.bench_function("traceable_enabled", |b| {
+    group.bench_function("traceable_enab", |b| {
         b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
     });
 
     init_tracing_subscriber(tracing_tracer);
 
     TRACING_GATE.store(false, Ordering::Relaxed);
-    group.bench_function("tracing_instrument_disabled", |b| {
+    group.bench_function("tracing_instrument_disa", |b| {
         b.iter(|| tracing_instrument_fn(black_box(WORKLOAD_ITERATIONS)));
     });
 
     TRACING_GATE.store(true, Ordering::Relaxed);
-    group.bench_function("tracing_instrument_enabled", |b| {
+    group.bench_function("tracing_instrument_enab", |b| {
         b.iter(|| tracing_instrument_fn(black_box(WORKLOAD_ITERATIONS)));
     });
 
@@ -145,7 +145,11 @@ fn bench_traceable_overhead(c: &mut Criterion) {
         .build()
         .expect("a free instrumentation slot");
     instr1.enable_all();
-    group.bench_function("traceable_one_named_instrumentation", |b| {
+    group.bench_function("traceable_one_named_enab", |b| {
+        b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
+    });
+    instr1.disable_all();
+    group.bench_function("traceable_one_named_disa", |b| {
         b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
     });
 
@@ -159,7 +163,11 @@ fn bench_traceable_overhead(c: &mut Criterion) {
         .build()
         .expect("a free instrumentation slot");
     instr2.enable_all();
-    group.bench_function("traceable_two_named_instrumentations", |b| {
+    group.bench_function("traceable_two_named_enab", |b| {
+        b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
+    });
+    instr2.disable_all();
+    group.bench_function("traceable_two_named_disa", |b| {
         b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
     });
 
