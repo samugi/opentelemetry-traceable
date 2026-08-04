@@ -4,11 +4,16 @@ use std::sync::atomic::AtomicU64;
 
 /// One entry per `#[traceable]` function, contributed by the macro at the
 /// call site and collected here via `linkme` before `main()` runs.
+///
+/// A trace site's **id** (used by [`crate::codec`] to encode a subset, and
+/// reported by [`crate::catalog`]) is simply its index in [`REGISTRY`] --
+/// dense and incremental, so it isn't stored here.
 #[derive(Debug)]
 pub struct TraceSite {
     /// The registry key used to enable/disable this function. Defaults to
     /// `module_path!() + "::" + fn_name`, or the macro's `name` argument.
     pub name: &'static str,
+
     /// Bitmask of which instrumentation slots currently have this function
     /// enabled -- bit `N` corresponds to instrumentation slot `N` (bit 0 is
     /// the always-present default instrumentation driven by `stylus::config`;

@@ -5,9 +5,9 @@
 //! via [`config`], without recompiling.
 
 pub mod catalog;
+pub mod codec;
 pub mod config;
 pub mod instrumentation;
 pub mod registry;
-pub mod subset;
 
 pub use stylus_macros::traceable;

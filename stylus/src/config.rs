@@ -12,7 +12,12 @@
 
 use crate::instrumentation::{self as instr, DEFAULT_SLOT};
 use crate::registry::REGISTRY;
-use crate::subset::DecodeError;
+
+// The lossless subset codec lives in [`crate::codec`]; re-export its surface
+// here so the whole enable/disable-by-id workflow is reachable through
+// `stylus::config` (`encode` to build a string, `set_enabled_encoded` to apply
+// one, `decode` to inspect one).
+pub use crate::codec::{DecodeError, decode, encode};
 
 /// Replace the active set: exactly the given names are enabled, everything
 /// else is disabled.
@@ -56,23 +61,23 @@ pub fn enabled_names() -> impl Iterator<Item = &'static str> {
     instr::slot_enabled_names(DEFAULT_SLOT)
 }
 
-/// Replace the active set from a blob produced by [`crate::subset::encode`]/
-/// [`crate::subset::encode_ids`] (see [`set_enabled`] for exact-name
-/// semantics; this is the same, decoded from a compact blob instead).
-pub fn set_enabled_encoded(blob: &str) -> Result<(), DecodeError> {
-    instr::slot_set_enabled_encoded(blob, DEFAULT_SLOT)
+/// Replace the active set from a string produced by [`encode`] (see
+/// [`set_enabled`] for exact-name semantics; this is the same, decoded from a
+/// compact id list instead).
+pub fn set_enabled_encoded(encoded: &str) -> Result<(), DecodeError> {
+    instr::slot_set_enabled_encoded(encoded, DEFAULT_SLOT)
 }
 
-/// Enable whatever's in the blob, leaving the rest of the current set
-/// untouched (see [`enable`]).
-pub fn enable_encoded(blob: &str) -> Result<(), DecodeError> {
-    instr::slot_enable_encoded(blob, DEFAULT_SLOT)
+/// Enable whatever's in the encoded id list, leaving the rest of the current
+/// set untouched (see [`enable`]).
+pub fn enable_encoded(encoded: &str) -> Result<(), DecodeError> {
+    instr::slot_enable_encoded(encoded, DEFAULT_SLOT)
 }
 
-/// Disable whatever's in the blob, leaving the rest of the current set
-/// untouched (see [`disable`]).
-pub fn disable_encoded(blob: &str) -> Result<(), DecodeError> {
-    instr::slot_disable_encoded(blob, DEFAULT_SLOT)
+/// Disable whatever's in the encoded id list, leaving the rest of the current
+/// set untouched (see [`disable`]).
+pub fn disable_encoded(encoded: &str) -> Result<(), DecodeError> {
+    instr::slot_disable_encoded(encoded, DEFAULT_SLOT)
 }
 
 /// Replace the *child-only* set: exactly the given names are put in child-only
@@ -88,12 +93,11 @@ pub fn set_child_only<'a, I: IntoIterator<Item = &'a str>>(names: I) {
     instr::slot_set_child_only(names, DEFAULT_SLOT);
 }
 
-/// Replace the child-only set from a blob produced by
-/// [`crate::subset::encode`]/[`crate::subset::encode_ids`] (see
+/// Replace the child-only set from a string produced by [`encode`] (see
 /// [`set_child_only`] for the semantics; this is the same, decoded from a
-/// compact blob instead).
-pub fn set_child_only_encoded(blob: &str) -> Result<(), DecodeError> {
-    instr::slot_set_child_only_encoded(blob, DEFAULT_SLOT)
+/// compact id list instead).
+pub fn set_child_only_encoded(encoded: &str) -> Result<(), DecodeError> {
+    instr::slot_set_child_only_encoded(encoded, DEFAULT_SLOT)
 }
 
 /// Registry keys currently in child-only mode.

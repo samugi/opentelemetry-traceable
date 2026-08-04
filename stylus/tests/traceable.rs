@@ -17,6 +17,25 @@ fn setup() -> InMemorySpanExporter {
     exporter
 }
 
+/// Encode a subset by name: resolve each name to its registry id via the
+/// catalog (the same mapping an application would use), then delta-encode the
+/// ids. Panics if a name isn't a known trace site.
+fn encode_names(names: &[&str]) -> String {
+    let catalog = stylus::catalog::catalog();
+    let mut ids: Vec<u64> = names
+        .iter()
+        .map(|name| {
+            catalog
+                .functions
+                .iter()
+                .find(|f| f.name == *name)
+                .unwrap_or_else(|| panic!("no traceable function named `{name}`"))
+                .id
+        })
+        .collect();
+    stylus::config::encode(&mut ids)
+}
+
 #[traceable]
 fn plain(x: u64) -> u64 {
     x + 1
@@ -238,11 +257,11 @@ fn enabled_names_reflects_the_active_subset() {
 }
 
 #[test]
-fn set_enabled_encoded_toggles_spans_via_a_blob() {
+fn set_enabled_encoded_toggles_spans_via_an_encoded_id_list() {
     let exporter = setup();
-    let blob = stylus::subset::encode(["nesting::child"], 0.01);
+    let encoded = encode_names(&["nesting::child"]);
 
-    stylus::config::set_enabled_encoded(&blob).unwrap();
+    stylus::config::set_enabled_encoded(&encoded).unwrap();
     let result = parent();
 
     assert_eq!(result, 7);
@@ -254,8 +273,8 @@ fn set_enabled_encoded_toggles_spans_via_a_blob() {
 #[test]
 fn enable_and_disable_encoded_are_additive_and_subtractive() {
     let exporter = setup();
-    let both = stylus::subset::encode(["nesting::parent", "nesting::child"], 0.01);
-    let just_parent = stylus::subset::encode(["nesting::parent"], 0.01);
+    let both = encode_names(&["nesting::parent", "nesting::child"]);
+    let just_parent = encode_names(&["nesting::parent"]);
 
     stylus::config::enable_encoded(&both).unwrap();
     stylus::config::disable_encoded(&just_parent).unwrap();
@@ -268,9 +287,9 @@ fn enable_and_disable_encoded_are_additive_and_subtractive() {
 }
 
 #[test]
-fn set_enabled_encoded_rejects_a_corrupt_blob() {
+fn set_enabled_encoded_rejects_a_corrupt_encoded_id_list() {
     setup();
-    assert!(stylus::config::set_enabled_encoded("not a valid blob!!").is_err());
+    assert!(stylus::config::set_enabled_encoded("not a valid list!!").is_err());
 }
 
 #[test]
@@ -284,17 +303,27 @@ fn catalog_reports_every_traceable_function_with_a_matching_id() {
     Widget.render();
 
     let catalog = stylus::catalog::catalog();
+
+    // Ids are dense registry indices: `0..n`, each reported exactly once.
+    let mut ids: Vec<u64> = catalog.functions.iter().map(|f| f.id).collect();
+    ids.sort_unstable();
+    let n = ids.len() as u64;
+    assert_eq!(ids, (0..n).collect::<Vec<_>>(), "ids must be a dense 0..n");
+
+    // The catalog's name->id mapping is what an encoded subset is built from,
+    // so encoding a name via the catalog and applying it must enable exactly
+    // that function.
     let by_name: std::collections::HashMap<_, _> =
         catalog.functions.iter().map(|f| (f.name, f.id)).collect();
-
-    assert_eq!(catalog.hash, "fnv1a64");
     for name in [
         "custom.span",
         "nesting::parent",
         "nesting::child",
         "widget::render",
     ] {
-        assert_eq!(by_name[name], stylus::subset::id_of(name));
+        assert!(by_name.contains_key(name), "{name} missing from catalog");
+        let decoded = stylus::config::decode(&encode_names(&[name])).unwrap();
+        assert_eq!(decoded, vec![by_name[name]]);
     }
 
     // catalog_json() must be well-formed JSON containing the same data.

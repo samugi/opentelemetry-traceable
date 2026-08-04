@@ -47,8 +47,8 @@ within an already-active (recording) span — never a root, even when enabled.
 
 ```rust
 stylus::config::set_child_only(["my_crate::shared_helper"]);
-// or from a compact blob, exactly like the enabled set:
-stylus::config::set_child_only_encoded(&blob)?;
+// or from a compact encoded id list, exactly like the enabled set:
+stylus::config::set_child_only_encoded(&encoded)?;
 ```
 
 Crucially this is **not** a source annotation — it's set at runtime, because whether a shared
@@ -108,31 +108,33 @@ and the measured no-regression numbers.
 
 ## Compact subset encoding
 
-`stylus::subset` encodes an arbitrary selection of functions as a **Bloom filter** instead of a
-name list. It tests membership directly against each function's own registry key — there's no
-positional index and no manifest to keep in sync with the registry, so a blob stays valid even
-if the registry's size or link order changes between builds.
+`stylus::codec` encodes an arbitrary selection of functions as a **lossless delta-encoded id
+list** instead of a name list. The ids are sorted, turned into LEB128 varint deltas, then
+base64'd (URL-safe, unpadded). There are **no false positives**: exactly the listed functions
+are toggled, nothing else.
 
 ```rust
-let blob = stylus::subset::encode(["my_crate::process", "kafka.fetch"], 0.01); // 0.01 = 1% target false-positive rate
-stylus::config::set_enabled_encoded(&blob)?;   // replace, like set_enabled
-stylus::config::enable_encoded(&blob)?;        // additive, like enable
-stylus::config::disable_encoded(&blob)?;       // subtractive, like disable
+let mut ids = vec![0, 3, 7];
+let encoded = stylus::codec::encode(&mut ids);
+stylus::config::set_enabled_encoded(&encoded)?;   // replace, like set_enabled
+stylus::config::enable_encoded(&encoded)?;        // additive, like enable
+stylus::config::disable_encoded(&encoded)?;       // subtractive, like disable
 ```
 
-For 100 of 100,000 functions at a 1% false-positive rate, that's ~120 bytes (~160 base64
-chars) — about 30x smaller than the name list. The tradeoff: a Bloom filter guarantees **zero
-false negatives** (every function you asked for really is enabled) at the cost of a small,
-tunable chance of **false positives** (a handful of *other* functions also end up traced). If
-you need exact behavior with no false positives at all, don't use this — build up the active
-set with the exact-name functions above instead.
+An `id` is a `#[traceable]` function's **index in the registry** (`stylus::registry::REGISTRY`):
+dense, 0-based, and reported by `stylus::catalog`. Because it's a positional index, an id (and
+any encoded string built from it) is **only valid for the exact binary that produced the
+catalog** — if the set of `#[traceable]` functions changes, ids shift and the catalog must be
+regenerated. That's the deliberate trade for losslessness: there's no build-independent name
+hash, but the encoding is exact and compact (deltas of a sorted dense index stay tiny). Sorting
+is done in place, which is why `encode` takes `&mut [u64]`. Decoding is
+`stylus::codec::decode(&str) -> Result<Vec<u64>, stylus::codec::DecodeError>`; a corrupt string
+returns `Err(DecodeError)` and leaves state unchanged. Both are re-exported as
+`stylus::config::encode` / `stylus::config::decode` / `stylus::config::DecodeError`.
 
-To enable (or disable) *everything* without enumerating every id, use
-`stylus::subset::encode_all()` instead of `encode`/`encode_ids`: a Bloom filter with every bit
-set matches any id unconditionally, so it's just the smallest possible valid blob (~13 base64
-chars) that happens to be a superset of the whole registry — no new code path, no sentinel
-value, it flows through `set_enabled_encoded`/`enable_encoded`/`disable_encoded` exactly like
-any other blob.
+To enable *everything* without enumerating every id from code, call
+`stylus::config::enable_all()`. For a config-file-driven setup, encode every id from the catalog
+instead. "Disable everything" is still just an empty enabled string.
 
 ## Letting an LLM (or a script) configure an arbitrary subset
 
@@ -147,61 +149,57 @@ reasonably be handed a plain name list:
    let json = stylus::catalog::catalog_json();
    ```
    This returns every `#[traceable]` function currently linked into the binary, each with the
-   same 64-bit id `stylus::subset` uses internally:
+   same registry-index id `stylus::codec` uses internally:
    ```json
    {
-     "hash": "fnv1a64",
-     "index_formula": "let h1 = id as u32; let h2 = (id >> 32) as u32; idx_i = h1.wrapping_add(i * h2) % m, for i in 0..k",
      "functions": [
-       { "name": "my_crate::process", "id": 11212198487925888491 },
-       { "name": "kafka.fetch", "id": 4108071546255015497 }
+       { "name": "my_crate::process", "id": 0 },
+       { "name": "kafka.fetch", "id": 1 }
      ]
    }
    ```
+   Because ids are positional registry indices, this catalog is only valid for the exact binary
+   that produced it — regenerate it whenever the set of `#[traceable]` functions changes.
    This is the *node* list. Call-graph edges aren't known to the running binary; run
    `stylus-cli graph` (below) over your source to augment this with `callers`/`callees` per
    function (plus an `unresolved_calls` worklist) — needed to pick enabled ancestors and
    child-only functions that keep the trace hierarchy intact.
 2. **Hand that JSON to the consumer** (an LLM with access to your source, a script, an
    operator) along with the task: "pick whichever of these functions should be traced."
-3. **Turn the picks into a blob.** Either in Rust:
+3. **Turn the picks into an encoded id list.** Either in Rust:
    ```rust
-   let blob = stylus::subset::encode_ids(chosen_ids, 0.01);
-   // or, from names instead of pre-looked-up ids:
-   let blob = stylus::subset::encode(chosen_names, 0.01);
+   let mut ids = chosen_ids;
+   let encoded = stylus::codec::encode(&mut ids);
    ```
    or without writing any Rust at all, via the CLI (see below).
-4. **Apply it**: `stylus::config::set_enabled_encoded(&blob)?`.
+4. **Apply it**: `stylus::config::set_enabled_encoded(&encoded)?`.
 
 ### The encoding, if you need to reproduce it without this crate
 
-Simple enough to reimplement in a short script, given a catalog dump's `{name, id}` list:
+Simple enough to reimplement in a short script, given a catalog dump's list of chosen `id`s
+(each an index into the registry):
 
-1. **Hash**: 64-bit FNV-1a over the name's UTF-8 bytes (offset basis `0xcbf29ce484222325`,
-   prime `0x100000001b3`) — this is the `id` in the catalog.
-2. **Sizing**: for `n` items at target false-positive rate `p`:
-   `m = ceil(-n * ln(p) / ln(2)^2)` bits, `k = round((m / n) * ln(2))` hash rounds.
-3. **Bit positions**: `h1 = id as u32`, `h2 = (id >> 32) as u32`. For `i` in `0..k`:
-   `idx_i = h1.wrapping_add(i * h2) % m` (Kirsch–Mitzenmacher double hashing) — set/check bit
-   `idx_i`.
-4. **Wire format**: `[u32 m, little-endian][u8 k][ceil(m/8) bytes, bit i at byte i/8, bit i%8]`,
-   then base64 (URL-safe, unpadded).
+1. **Sort** the chosen ids ascending.
+2. **Delta**: replace each id with its difference from the previous one (the first is left
+   as-is), so you have a list of non-negative deltas.
+3. **Varint**: encode each delta as an LEB128 unsigned varint (7 bits per byte, low bit of the
+   continuation flag set on all but the last byte).
+4. **Wire format**: concatenate the varint bytes, then base64 (URL-safe, unpadded).
 
 ## `stylus-cli`
 
-A standalone binary for turning a name or id list into a blob without writing any Rust:
+A standalone binary for turning an id list into an encoded id list without writing any Rust:
 
 ```
-stylus-cli encode --names my_crate::process kafka.fetch [--fp-rate 0.01]
-stylus-cli encode --ids 11212198487925888491 4108071546255015497 [--fp-rate 0.01]
-stylus-cli encode --all   # match every function, no names/ids needed
+stylus-cli encode --ids 0 3 7   # encode these ids
+stylus-cli encode               # or read ids from stdin (whitespace/newline separated integers)
 ```
 
-Reads from stdin (one entry per line) if no values are given as arguments (and neither `--all`
-is passed). Prints the base64 blob to stdout. It's standalone — it only hashes/encodes what
-it's given; it has no way to introspect any particular application's registry. To get the list
-of functions your application actually knows about (and their ids) for a human or LLM to pick
-from, call `stylus::catalog::catalog_json()` from within that application, as described above.
+It accepts **only ids**: the standalone CLI has no access to any app's registry, and since ids
+are registry indices they can't be derived from names without it. Prints the base64 encoded id
+list to stdout. To get the list of functions your application actually knows about (and their
+ids) for a human or LLM to pick from, call `stylus::catalog::catalog_json()` from within that
+application, as described above.
 
 It also builds the call graph, by statically parsing your source (no compile, no run):
 
@@ -250,11 +248,11 @@ than trying to generate it themselves. See `stylus-demo/AGENTS.md` and
 ## Crate layout
 
 - `stylus` — runtime: `#[traceable]` re-export, `registry` (the `linkme`-collected
-  `TraceSite`/`REGISTRY`), `config` (enable/disable, exact and encoded), `subset` (Bloom filter
-  encode/decode), `catalog` (the `{name, id}` dump).
+  `TraceSite`/`REGISTRY`), `config` (enable/disable, exact and encoded), `codec` (lossless
+  delta-encoded id list encode/decode), `catalog` (the `{name, id}` dump).
 - `stylus-macros` — the `#[traceable]` proc-macro implementation.
-- `stylus-cli` — the standalone binary described above (built with `clap`): `encode` (names/ids
-  → blob) and `graph` (source → call-graph edges, via `syn`).
+- `stylus-cli` — the standalone binary described above (built with `clap`): `encode` (ids
+  → encoded id list) and `graph` (source → call-graph edges, via `syn`).
 
 ## Benchmarks
 

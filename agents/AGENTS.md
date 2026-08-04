@@ -2,11 +2,11 @@
 
 > **Written for:** `stylus` @ `main` (this repo has no tagged releases yet, so `main` is the
 > only version — it can gain new flags at any time). This file assumes `stylus-cli` supports the
-> `encode` subcommand (`--names`, `--ids`, `--all`, `--fp-rate`) and the `graph` subcommand
-> (`--catalog`, `--src`). If `stylus-cli --help` doesn't list `graph`, or `stylus-cli encode
-> --help` is missing a flag, your local copy of this file or your installed `stylus-cli` is
-> stale — re-fetch this file from https://github.com/samugi/stylus (`agents/AGENTS.md`) and
-> reinstall `stylus-cli` (step 1) before continuing.
+> `encode` subcommand (`--ids`) and the `graph` subcommand (`--catalog`, `--src`). If
+> `stylus-cli --help` doesn't list `graph`, or `stylus-cli encode` doesn't take `--ids`, your
+> local copy of this file or your installed `stylus-cli` is stale — re-fetch this file from
+> https://github.com/samugi/stylus (`agents/AGENTS.md`) and reinstall `stylus-cli` (step 1)
+> before continuing.
 
 This application uses [`stylus`](https://github.com/samugi/stylus) for dynamic, per-function
 tracing: any `#[traceable]` function can be turned on/off at runtime by editing a local config
@@ -15,20 +15,23 @@ follow this exact procedure step by step. Don't write a new script, don't improv
 mechanism, and don't skip a step — everything you need is `stylus-cli`, a committed call-graph
 catalog, and editing one config file.
 
-The config has **two** blobs:
+The config has **two** encoded id lists:
 
-- `enabled_blob` — which functions trace at all.
-- `child_only_blob` — which of those are *child-only*: they only span when they already have an
+- `enabled` — which functions trace at all.
+- `child_only` — which of those are *child-only*: they only span when they already have an
   active parent span, never as a root. This is what keeps a shared helper (a db/cache call used
   by many flows) from orphaning as a stray root span on the flows you didn't ask to trace.
 
-You compute both mechanically from the catalog graph. Nothing here requires understanding the
-code — it's graph traversal plus one membership rule.
+Each is a compact, lossless base64 encoding of a set of trace-site ids — no false positives,
+exactly the listed functions toggle. An `id` is a function's index in the running binary's
+registry, so ids (and any encoded value) are **specific to that build**: always use a catalog
+from the current binary. You compute both sets mechanically from the catalog graph. Nothing here
+requires understanding the code — it's graph traversal plus one membership rule.
 
 ## 1. Make sure `stylus-cli` is current
 
 Run `stylus-cli --help` and confirm it lists both `encode` and `graph`. Then
-`stylus-cli encode --help` and confirm `--names`, `--ids`, `--all`, `--fp-rate`.
+`stylus-cli encode --help` and confirm it takes `--ids`.
 
 - **All present**: good — continue.
 - **`graph` missing, a flag missing, or the command isn't found**: (re)install it:
@@ -42,10 +45,11 @@ binary (no version tags, so "already installed" doesn't mean "has what you need"
 
 ## Shortcut: enabling or disabling *everything*
 
-- **Enable everything**: set `enabled_blob` to `stylus-cli encode --all` and `child_only_blob`
-  to `""` (step 6). No catalog needed — everything traces, and since every caller is enabled
-  too, nothing orphans.
-- **Disable everything**: set *both* blobs to `""` (step 6). No blob needed.
+- **Disable everything**: set *both* `enabled` and `child_only` to `""` (step 6). No catalog
+  needed.
+- **Enable everything**: there's no all-in-one shortcut anymore. Get the catalog (step 2), then
+  set `enabled` to `stylus-cli encode --ids <every id in the catalog>` and `child_only` to `""`.
+  Everything traces, and since every caller is enabled too, nothing orphans.
 
 Otherwise, continue.
 
@@ -56,10 +60,12 @@ You need a JSON catalog of every `#[traceable]` function **with its call-graph e
 the common case.
 
 1. **Find the committed node dump.** A `{name, id}` list, commonly `stylus-catalog.json` or
-   `catalog.json` at the repo root or `docs/`. `grep -rl '"hash": "fnv1a64"' .` finds it if the
-   name isn't obvious. **If there's none, stop and ask the user** to generate it (it's produced
-   by the app's own binary — normally `cargo run --quiet -- catalog > stylus-catalog.json` — not
-   something you can produce; see the note at the bottom for why).
+   `catalog.json` at the repo root or `docs/`. If the name isn't obvious,
+   `grep -rl '"functions"' . | xargs grep -l '"id"'` finds catalog-shaped JSON. **If there's
+   none, stop and ask the user** to generate it (it's produced by the app's own binary —
+   normally `cargo run --quiet -- catalog > stylus-catalog.json` — not something you can
+   produce; see the note at the bottom for why). Regenerate it if it looks stale — ids must
+   match the current binary.
 2. **Make sure it has edges.** Check whether the functions have `callers`/`callees` fields.
    - **They do**: use the file as-is.
    - **They don't** (just `{name, id}`): add them yourself — this part you *can* do, it only
@@ -123,24 +129,24 @@ requested entry point (or, if none, any one node of the cycle) from `CO`. Rare, 
 
 ## 6. Update the config, then verify
 
-Generate the two blobs (order of ids doesn't matter):
+Generate the two encoded values (order of ids doesn't matter):
 
 ```
-stylus-cli encode --ids <every id in E>          # -> enabled_blob
-stylus-cli encode --ids <every id in CO>         # -> child_only_blob
+stylus-cli encode --ids <every id in E>          # -> enabled
+stylus-cli encode --ids <every id in CO>         # -> child_only
 ```
 
 Find the local YAML/JSON config — commonly `config.yaml`/`config.json` at the repo root, with
-`tracing.enabled_blob` and `tracing.child_only_blob`. **If it isn't obviously the right
-file/fields, ask the user — don't guess.** Set both fields (for a disable request, set both to
-`""`). This replaces whatever was there; if asked to *add* to what's currently on, include the
+`tracing.enabled` and `tracing.child_only`. **If it isn't obviously the right file/fields, ask
+the user — don't guess.** Set both fields (for a disable request, set both to `""`). This
+replaces whatever was there; if asked to *add* to what's currently on, include the
 previously-enabled ids in `E` too.
 
 **Then re-read both fields and compare them character-for-character against what `encode`
 printed.** Don't report success until they match exactly. A value off by even one character is
 invalid and silently leaves tracing unchanged (a real, previously-seen failure mode: one
-dropped character makes the blob fail to decode, and the app keeps its old state with no visible
-effect).
+dropped character makes the encoded value fail to decode, and the app keeps its old state with
+no visible effect).
 
 ## 7. Report
 

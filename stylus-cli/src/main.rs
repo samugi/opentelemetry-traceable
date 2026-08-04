@@ -1,12 +1,13 @@
-//! Standalone helper to turn a list of function names or ids into a blob for
-//! `stylus::config::set_enabled_encoded` (and friends) -- no Rust required on
-//! the caller's side, just this binary.
+//! Standalone helper to turn a list of trace-site ids into a compact encoded
+//! string for `stylus::config::set_enabled_encoded` (and friends) -- no Rust
+//! required on the caller's side, just this binary.
 //!
-//! This tool only hashes/encodes what it's given; it has no access to any
-//! particular application's registry. To find out which functions an
-//! application actually knows about (and their ids), call
-//! `stylus::catalog::catalog_json()` *from within that application* -- see the
-//! repo README for the full workflow.
+//! This tool only encodes the ids it's given; it has no access to any
+//! particular application's registry. Ids are registry indices, so both the
+//! id list and the encoded string are only meaningful for the exact binary
+//! that produced them. To find out which functions an application knows about
+//! (and their ids), call `stylus::catalog::catalog_json()` *from within that
+//! application* -- see the repo README for the full workflow.
 
 mod graph;
 
@@ -15,7 +16,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use stylus::subset;
+use stylus::codec;
 
 #[derive(Parser)]
 #[command(name = "stylus-cli", version, about)]
@@ -26,35 +27,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Encode function names or ids into a compact blob for
+    /// Encode a list of trace-site ids into a compact, lossless string for
     /// `stylus::config::set_enabled_encoded` (and friends).
     ///
-    /// Reads names from stdin (one per line) if neither --names nor --ids is
-    /// given. This tool is standalone: it only hashes/encodes what it's
-    /// given. To get the list of functions an application actually knows
-    /// about (and their ids) for a human or LLM to pick from, call
+    /// Reads ids from stdin (whitespace/newline separated) if --ids is not
+    /// given. This tool is standalone: it only encodes the ids it's given, and
+    /// ids are registry indices, so the output is valid only for the same
+    /// binary the ids came from. To get the list of functions an application
+    /// knows about (and their ids) for a human or LLM to pick from, call
     /// `stylus::catalog::catalog_json()` from within that application.
     Encode {
-        /// Registry names to enable (mutually exclusive with --ids/--all).
-        #[arg(long, num_args = 1.., conflicts_with_all = ["ids", "all"])]
-        names: Option<Vec<String>>,
-
-        /// Precomputed ids to enable, e.g. read from a catalog dump
-        /// (mutually exclusive with --names/--all).
-        #[arg(long, num_args = 1.., conflicts_with_all = ["names", "all"])]
+        /// Ids to enable, e.g. read from a catalog dump. If omitted, ids are
+        /// read from stdin (whitespace or newline separated).
+        #[arg(long, num_args = 1..)]
         ids: Option<Vec<u64>>,
-
-        /// Match every function, without listing any names/ids -- for
-        /// "enable/disable everything" (mutually exclusive with
-        /// --names/--ids).
-        #[arg(long, conflicts_with_all = ["names", "ids"])]
-        all: bool,
-
-        /// Target false-positive rate for the Bloom filter. Ignored with
-        /// --all (there's nothing to tune -- it's deterministically a
-        /// match for everything).
-        #[arg(long, default_value_t = 0.01)]
-        fp_rate: f64,
     },
 
     /// Augment a catalog node dump with call-graph edges by statically
@@ -78,13 +64,8 @@ enum Command {
 
 fn main() -> ExitCode {
     match Cli::parse().command {
-        Command::Encode {
-            names,
-            ids,
-            all,
-            fp_rate,
-        } => {
-            println!("{}", encode(names, ids, all, fp_rate));
+        Command::Encode { ids } => {
+            println!("{}", encode(ids));
             ExitCode::SUCCESS
         }
         Command::Graph { catalog, src } => match graph::run(&catalog, &src) {
@@ -100,25 +81,19 @@ fn main() -> ExitCode {
     }
 }
 
-fn encode(names: Option<Vec<String>>, ids: Option<Vec<u64>>, all: bool, fp_rate: f64) -> String {
-    match (names, ids, all) {
-        (_, _, true) => subset::encode_all(),
-        (Some(names), None, false) => subset::encode(names.iter().map(String::as_str), fp_rate),
-        (None, Some(ids), false) => subset::encode_ids(ids, fp_rate),
-        (None, None, false) => {
-            let mut input = String::new();
-            io::stdin()
-                .read_to_string(&mut input)
-                .unwrap_or_else(|e| panic!("failed to read stdin: {e}"));
-            let names: Vec<&str> = input
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .collect();
-            subset::encode(names, fp_rate)
-        }
-        (Some(_), Some(_), false) => {
-            unreachable!("clap enforces --names/--ids are mutually exclusive")
-        }
-    }
+fn encode(ids: Option<Vec<u64>>) -> String {
+    let mut ids = ids.unwrap_or_else(|| {
+        let mut input = String::new();
+        io::stdin()
+            .read_to_string(&mut input)
+            .unwrap_or_else(|e| panic!("failed to read stdin: {e}"));
+        input
+            .split_whitespace()
+            .map(|tok| {
+                tok.parse::<u64>()
+                    .unwrap_or_else(|e| panic!("invalid id `{tok}`: {e}"))
+            })
+            .collect()
+    });
+    codec::encode(&mut ids)
 }

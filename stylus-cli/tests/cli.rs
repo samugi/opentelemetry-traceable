@@ -33,29 +33,31 @@ fn run(args: &[&str], stdin: Option<&str>) -> (String, String, i32) {
 }
 
 #[test]
-fn encode_names_prints_a_non_empty_blob() {
-    let (stdout, _stderr, code) = run(&["encode", "--names", "foo", "bar", "baz"], None);
+fn encode_ids_prints_a_non_empty_string() {
+    let (stdout, _stderr, code) = run(&["encode", "--ids", "1", "5", "9"], None);
     assert_eq!(code, 0);
     assert!(!stdout.trim().is_empty());
 }
 
 #[test]
-fn encode_names_and_encode_ids_agree() {
-    let (by_name, _, code1) = run(&["encode", "--names", "foo", "bar", "baz"], None);
-    let id_foo = stylus::subset::id_of("foo").to_string();
-    let id_bar = stylus::subset::id_of("bar").to_string();
-    let id_baz = stylus::subset::id_of("baz").to_string();
-    let (by_id, _, code2) = run(&["encode", "--ids", &id_foo, &id_bar, &id_baz], None);
+fn encode_ids_round_trips_and_is_order_independent() {
+    let (ascending, _, code1) = run(&["encode", "--ids", "1", "5", "9"], None);
+    let (shuffled, _, code2) = run(&["encode", "--ids", "9", "1", "5"], None);
 
     assert_eq!(code1, 0);
     assert_eq!(code2, 0);
-    assert_eq!(by_name.trim(), by_id.trim());
+    // Encoding sorts, so order in doesn't change the output.
+    assert_eq!(ascending.trim(), shuffled.trim());
+    assert_eq!(
+        stylus::codec::decode(ascending.trim()).unwrap(),
+        vec![1, 5, 9]
+    );
 }
 
 #[test]
-fn encode_reads_names_from_stdin_when_neither_flag_given() {
-    let (from_args, _, _) = run(&["encode", "--names", "a", "b", "c"], None);
-    let (from_stdin, _, code) = run(&["encode"], Some("a\nb\nc\n"));
+fn encode_reads_ids_from_stdin_when_flag_omitted() {
+    let (from_args, _, _) = run(&["encode", "--ids", "1", "2", "3"], None);
+    let (from_stdin, _, code) = run(&["encode"], Some("1\n2\n3\n"));
 
     assert_eq!(code, 0);
     assert_eq!(from_args.trim(), from_stdin.trim());
@@ -69,28 +71,8 @@ fn unknown_subcommand_fails_with_usage() {
 }
 
 #[test]
-fn names_and_ids_are_mutually_exclusive() {
-    let (_stdout, stderr, code) = run(&["encode", "--names", "a", "--ids", "1"], None);
+fn encode_rejects_non_numeric_ids() {
+    let (_stdout, _stderr, code) = run(&["encode", "--ids", "not-a-number"], None);
+    // clap rejects a non-u64 value for --ids before the command even runs.
     assert_eq!(code, 2);
-    assert!(stderr.contains("cannot be used with"));
-}
-
-#[test]
-fn encode_all_prints_a_blob_that_matches_anything() {
-    let (stdout, _stderr, code) = run(&["encode", "--all"], None);
-    assert_eq!(code, 0);
-    let blob = stdout.trim();
-    assert!(!blob.is_empty());
-    assert!(stylus::subset::contains(blob, "totally-unregistered-name").unwrap());
-}
-
-#[test]
-fn all_conflicts_with_names_and_ids() {
-    let (_stdout, stderr, code) = run(&["encode", "--names", "a", "--all"], None);
-    assert_eq!(code, 2);
-    assert!(stderr.contains("cannot be used with"));
-
-    let (_stdout, stderr, code) = run(&["encode", "--ids", "1", "--all"], None);
-    assert_eq!(code, 2);
-    assert!(stderr.contains("cannot be used with"));
 }

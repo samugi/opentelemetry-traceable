@@ -47,8 +47,8 @@ use opentelemetry::trace::{SpanBuilder, TraceContextExt, Tracer};
 use opentelemetry::{Context, KeyValue};
 use smallvec::SmallVec;
 
+use crate::codec::{self, DecodeError};
 use crate::registry::{REGISTRY, TraceSite};
-use crate::subset::{self, DecodeError};
 
 /// Total number of instrumentation slots, including the default one -- one bit
 /// per slot in each site's `u64` masks. Bit 0 is [`DEFAULT_SLOT`]; bits 1..64
@@ -71,7 +71,7 @@ fn bit(slot: u8) -> u64 {
     1u64 << slot
 }
 
-/// How a name/blob match updates a slot's bit.
+/// How a name/id match updates a slot's bit.
 #[derive(Clone, Copy)]
 enum BitOp {
     /// Set the bit on matches, clear it on non-matches (whole-set replace).
@@ -104,16 +104,18 @@ fn apply_names<'a>(
     }
 }
 
-fn apply_blob(
-    blob: &str,
+fn apply_encoded(
+    encoded: &str,
     field: impl Fn(&TraceSite) -> &AtomicU64,
     slot: u8,
     op: BitOp,
 ) -> Result<(), DecodeError> {
-    let filter = subset::decode(blob)?;
+    // Decoded ids are trace-site indices into `REGISTRY`; membership is a
+    // direct positional lookup -- no hashing, no false positives.
+    let wanted: HashSet<u64> = codec::decode(encoded)?.into_iter().collect();
     let b = bit(slot);
-    for site in REGISTRY.iter() {
-        let hit = filter.contains_id(subset::id_of(site.name));
+    for (idx, site) in REGISTRY.iter().enumerate() {
+        let hit = wanted.contains(&(idx as u64));
         match (op, hit) {
             (BitOp::Replace | BitOp::Add, true) => {
                 field(site).fetch_or(b, Ordering::Relaxed);
@@ -153,16 +155,16 @@ pub(crate) fn slot_disable_all(slot: u8) {
     }
 }
 
-pub(crate) fn slot_set_enabled_encoded(blob: &str, slot: u8) -> Result<(), DecodeError> {
-    apply_blob(blob, |s| &s.enabled_mask, slot, BitOp::Replace)
+pub(crate) fn slot_set_enabled_encoded(encoded: &str, slot: u8) -> Result<(), DecodeError> {
+    apply_encoded(encoded, |s| &s.enabled_mask, slot, BitOp::Replace)
 }
 
-pub(crate) fn slot_enable_encoded(blob: &str, slot: u8) -> Result<(), DecodeError> {
-    apply_blob(blob, |s| &s.enabled_mask, slot, BitOp::Add)
+pub(crate) fn slot_enable_encoded(encoded: &str, slot: u8) -> Result<(), DecodeError> {
+    apply_encoded(encoded, |s| &s.enabled_mask, slot, BitOp::Add)
 }
 
-pub(crate) fn slot_disable_encoded(blob: &str, slot: u8) -> Result<(), DecodeError> {
-    apply_blob(blob, |s| &s.enabled_mask, slot, BitOp::Remove)
+pub(crate) fn slot_disable_encoded(encoded: &str, slot: u8) -> Result<(), DecodeError> {
+    apply_encoded(encoded, |s| &s.enabled_mask, slot, BitOp::Remove)
 }
 
 pub(crate) fn slot_is_enabled(name: &str, slot: u8) -> bool {
@@ -193,8 +195,8 @@ pub(crate) fn slot_disable_child_only<'a>(names: impl IntoIterator<Item = &'a st
     apply_names(names, |s| &s.child_only_mask, slot, BitOp::Remove);
 }
 
-pub(crate) fn slot_set_child_only_encoded(blob: &str, slot: u8) -> Result<(), DecodeError> {
-    apply_blob(blob, |s| &s.child_only_mask, slot, BitOp::Replace)
+pub(crate) fn slot_set_child_only_encoded(encoded: &str, slot: u8) -> Result<(), DecodeError> {
+    apply_encoded(encoded, |s| &s.child_only_mask, slot, BitOp::Replace)
 }
 
 pub(crate) fn slot_child_only_names(slot: u8) -> impl Iterator<Item = &'static str> {
@@ -483,20 +485,20 @@ impl Instrumentation {
         slot_disable_all(self.slot);
     }
 
-    /// Replace the enabled set from a compact blob (see
+    /// Replace the enabled set from a compact encoded id list (see
     /// [`crate::config::set_enabled_encoded`]).
-    pub fn set_enabled_encoded(&self, blob: &str) -> Result<(), DecodeError> {
-        slot_set_enabled_encoded(blob, self.slot)
+    pub fn set_enabled_encoded(&self, encoded: &str) -> Result<(), DecodeError> {
+        slot_set_enabled_encoded(encoded, self.slot)
     }
 
-    /// Enable whatever's in the blob (additive).
-    pub fn enable_encoded(&self, blob: &str) -> Result<(), DecodeError> {
-        slot_enable_encoded(blob, self.slot)
+    /// Enable whatever's in the encoded id list (additive).
+    pub fn enable_encoded(&self, encoded: &str) -> Result<(), DecodeError> {
+        slot_enable_encoded(encoded, self.slot)
     }
 
-    /// Disable whatever's in the blob.
-    pub fn disable_encoded(&self, blob: &str) -> Result<(), DecodeError> {
-        slot_disable_encoded(blob, self.slot)
+    /// Disable whatever's in the encoded id list.
+    pub fn disable_encoded(&self, encoded: &str) -> Result<(), DecodeError> {
+        slot_disable_encoded(encoded, self.slot)
     }
 
     /// Replace this instrumentation's child-only set with exactly `names` (see
@@ -515,9 +517,9 @@ impl Instrumentation {
         slot_disable_child_only(names, self.slot);
     }
 
-    /// Replace the child-only set from a compact blob.
-    pub fn set_child_only_encoded(&self, blob: &str) -> Result<(), DecodeError> {
-        slot_set_child_only_encoded(blob, self.slot)
+    /// Replace the child-only set from a compact encoded id list.
+    pub fn set_child_only_encoded(&self, encoded: &str) -> Result<(), DecodeError> {
+        slot_set_child_only_encoded(encoded, self.slot)
     }
 
     /// Whether `name` is enabled for this instrumentation.
