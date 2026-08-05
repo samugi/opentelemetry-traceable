@@ -92,30 +92,67 @@ fn bench_traceable_overhead(c: &mut Criterion) {
         b.iter(|| plain(black_box(WORKLOAD_ITERATIONS)));
     });
 
-    stylus::config::disable_all();
+    // No instrumentation exists yet, so every site's mask is 0 -- the
+    // single-atomic-load fast path.
     group.bench_function("traceable_disa", |b| {
         b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
     });
 
-    // A real (if in-process) exporter, so the "enabled" number reflects
-    // actual span construction + export cost rather than a no-op global
-    // tracer stub. Shared with the `tracing`-based benchmark below via a
-    // second tracer from the same provider, so both "enabled" numbers pay
-    // for the same real span construction + export work.
-    let exporter = InMemorySpanExporter::default();
-    let provider = SdkTracerProvider::builder()
-        .with_simple_exporter(exporter)
+    // Real (if in-process) exporters throughout, so the "enabled" numbers
+    // reflect actual span construction + export cost rather than a no-op
+    // tracer stub.
+    let exporter1 = InMemorySpanExporter::default();
+    let provider1 = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter1)
         .build();
-    let tracing_tracer = provider.tracer("tracing_bench");
-    opentelemetry::global::set_tracer_provider(provider);
+    let instr1 = Instrumentation::builder()
+        .name("bench-1")
+        .tracer(provider1.tracer("bench-1"))
+        .build()
+        .expect("a free instrumentation slot");
 
-    stylus::config::enable_all();
-    stylus::config::set_child_only_encoded(&stylus::config::encode(&mut [])).unwrap();
-    group.bench_function("traceable_enab", |b| {
+    instr1.enable_all();
+    group.bench_function("traceable_one_instr_enab", |b| {
+        b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
+    });
+    instr1.disable_all();
+    group.bench_function("traceable_one_instr_disa", |b| {
         b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
     });
 
-    init_tracing_subscriber(tracing_tracer);
+    // A second instrumentation over the same function: `start_spans` now builds
+    // two spans per call, one per active slot, from two different tracers.
+    let exporter2 = InMemorySpanExporter::default();
+    let provider2 = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter2)
+        .build();
+    let instr2 = Instrumentation::builder()
+        .name("bench-2")
+        .tracer(provider2.tracer("bench-2"))
+        .build()
+        .expect("a free instrumentation slot");
+
+    instr1.enable_all();
+    instr2.enable_all();
+    group.bench_function("traceable_two_instr_enab", |b| {
+        b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
+    });
+    instr1.disable_all();
+    instr2.disable_all();
+    group.bench_function("traceable_two_instr_disa", |b| {
+        b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
+    });
+
+    drop(instr1);
+    drop(instr2);
+
+    // The `tracing` comparison gets its own provider/exporter, so it pays for
+    // the same real span construction + export work the numbers above do.
+    let tracing_exporter = InMemorySpanExporter::default();
+    let tracing_provider = SdkTracerProvider::builder()
+        .with_simple_exporter(tracing_exporter)
+        .build();
+    init_tracing_subscriber(tracing_provider.tracer("tracing_bench"));
 
     TRACING_GATE.store(false, Ordering::Relaxed);
     group.bench_function("tracing_instrument_disa", |b| {
@@ -126,53 +163,6 @@ fn bench_traceable_overhead(c: &mut Criterion) {
     group.bench_function("tracing_instrument_enab", |b| {
         b.iter(|| tracing_instrument_fn(black_box(WORKLOAD_ITERATIONS)));
     });
-
-    // Named instrumentations exercise the multi-slot path (`start_spans` + the
-    // one per-call `Context::with_value` envelope). `traceable_enabled` above is
-    // the default-only (`mask == 1`) path -- the byte-identical-to-before code --
-    // so it doubles as the no-regression reference these are measured against.
-    // Disable the default slot so the mask holds only the named bit(s),
-    // isolating the per-active-slot cost.
-    stylus::config::disable_all();
-
-    let exporter1 = InMemorySpanExporter::default();
-    let provider1 = SdkTracerProvider::builder()
-        .with_simple_exporter(exporter1)
-        .build();
-    let instr1 = Instrumentation::builder()
-        .name("bench-1")
-        .tracer(provider1.tracer("bench-1"))
-        .build()
-        .expect("a free instrumentation slot");
-    instr1.enable_all();
-    group.bench_function("traceable_one_named_enab", |b| {
-        b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
-    });
-    instr1.disable_all();
-    group.bench_function("traceable_one_named_disa", |b| {
-        b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
-    });
-
-    let exporter2 = InMemorySpanExporter::default();
-    let provider2 = SdkTracerProvider::builder()
-        .with_simple_exporter(exporter2)
-        .build();
-    let instr2 = Instrumentation::builder()
-        .name("bench-2")
-        .tracer(provider2.tracer("bench-2"))
-        .build()
-        .expect("a free instrumentation slot");
-    instr2.enable_all();
-    group.bench_function("traceable_two_named_enab", |b| {
-        b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
-    });
-    instr2.disable_all();
-    group.bench_function("traceable_two_named_disa", |b| {
-        b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
-    });
-
-    drop(instr1);
-    drop(instr2);
 
     group.finish();
 }

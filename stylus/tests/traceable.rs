@@ -1,20 +1,37 @@
 //! Integration tests for `#[traceable]` span creation and dynamic enable/disable.
+//!
+//! Every test drives its own [`Instrumentation`] with its own in-memory
+//! exporter, and a fresh instrumentation starts with every bit clear -- so
+//! there's no global tracer or default instrumentation to reset between tests.
+//!
+//! What *is* still shared is the traced functions themselves: their enabled bits
+//! live in the process-global `linkme` registry, so a test that enables a
+//! function will collect a span from any concurrently-running test that calls
+//! it. Hence `cargo nextest run` (process-per-test), enforced by
+//! `check_test_runner.rs`.
 
-use opentelemetry::global;
-use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::Context;
+use opentelemetry::trace::{
+    SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TracerProvider as _,
+};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
 use stylus::instrumentation::Instrumentation;
 use stylus::traceable;
 
-fn setup() -> InMemorySpanExporter {
+/// Build an instrumentation with its own in-memory exporter/provider. The
+/// returned exporter observes only this instrumentation's spans; the tracer
+/// keeps its provider alive for the instrumentation's lifetime.
+fn instr(name: &'static str) -> (Instrumentation, InMemorySpanExporter) {
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
-    global::set_tracer_provider(provider);
-    stylus::config::disable_all();
-    stylus::config::set_child_only_encoded(&encode_names(&[])).unwrap();
-    exporter
+    let instr = Instrumentation::builder()
+        .name(name)
+        .tracer(provider.tracer(name))
+        .build()
+        .expect("a free instrumentation slot");
+    (instr, exporter)
 }
 
 /// Encode a subset by name: resolve each name to its registry id via the
@@ -33,7 +50,7 @@ fn encode_names(names: &[&str]) -> String {
                 .id
         })
         .collect();
-    stylus::config::encode(&mut ids)
+    stylus::codec::encode(&mut ids)
 }
 
 #[traceable]
@@ -41,7 +58,7 @@ fn plain(x: u64) -> u64 {
     x + 1
 }
 
-#[traceable(name = "custom.span", tracer = "test-tracer")]
+#[traceable(name = "custom.span")]
 fn named() -> u64 {
     42
 }
@@ -86,6 +103,13 @@ async fn shared_async_leaf() -> u64 {
     5
 }
 
+/// Reports whether the ambient `Context`'s own span slot holds a valid span --
+/// used to prove instrumentations never write into it.
+#[traceable(name = "probe::ambient")]
+fn probe_ambient() -> bool {
+    Context::current().span().span_context().is_valid()
+}
+
 struct Widget;
 
 impl Widget {
@@ -97,7 +121,7 @@ impl Widget {
 
 #[test]
 fn disabled_by_default_emits_no_span() {
-    let exporter = setup();
+    let (_instr, exporter) = instr("A");
 
     let result = plain(1);
 
@@ -107,8 +131,10 @@ fn disabled_by_default_emits_no_span() {
 
 #[test]
 fn enabling_emits_a_span_with_default_name() {
-    let exporter = setup();
-    stylus::config::enable_encoded(&encode_names(&[concat!(module_path!(), "::plain")])).unwrap();
+    let (instr, exporter) = instr("A");
+    instr
+        .enable_encoded(&encode_names(&[concat!(module_path!(), "::plain")]))
+        .unwrap();
 
     let result = plain(1);
 
@@ -119,9 +145,11 @@ fn enabling_emits_a_span_with_default_name() {
 }
 
 #[test]
-fn custom_name_and_tracer() {
-    let exporter = setup();
-    stylus::config::enable_encoded(&encode_names(&["custom.span"])).unwrap();
+fn custom_span_name_and_the_instrumentations_tracer_scope() {
+    let (instr, exporter) = instr("test-tracer");
+    instr
+        .enable_encoded(&encode_names(&["custom.span"]))
+        .unwrap();
 
     let result = named();
 
@@ -129,13 +157,16 @@ fn custom_name_and_tracer() {
     let spans = exporter.get_finished_spans().unwrap();
     assert_eq!(spans.len(), 1);
     assert_eq!(spans[0].name, "custom.span");
+    // The scope comes from the instrumentation's own tracer -- a call site has
+    // no say in it, since the `tracer` macro argument no longer exists.
     assert_eq!(spans[0].instrumentation_scope.name(), "test-tracer");
 }
 
 #[test]
 fn fields_become_span_attributes() {
-    let exporter = setup();
-    stylus::config::enable_encoded(&encode_names(&[concat!(module_path!(), "::with_fields")]))
+    let (instr, exporter) = instr("A");
+    instr
+        .enable_encoded(&encode_names(&[concat!(module_path!(), "::with_fields")]))
         .unwrap();
 
     let result = with_fields("abc".to_string());
@@ -158,8 +189,9 @@ fn fields_become_span_attributes() {
 
 #[tokio::test]
 async fn async_function_is_instrumented_when_enabled() {
-    let exporter = setup();
-    stylus::config::enable_encoded(&encode_names(&[concat!(module_path!(), "::plain_async")]))
+    let (instr, exporter) = instr("A");
+    instr
+        .enable_encoded(&encode_names(&[concat!(module_path!(), "::plain_async")]))
         .unwrap();
 
     let result = plain_async(1).await;
@@ -172,8 +204,10 @@ async fn async_function_is_instrumented_when_enabled() {
 
 #[test]
 fn nested_spans_share_a_trace_and_correct_parent() {
-    let exporter = setup();
-    stylus::config::enable_encoded(&encode_names(&["nesting::parent", "nesting::child"])).unwrap();
+    let (instr, exporter) = instr("A");
+    instr
+        .enable_encoded(&encode_names(&["nesting::parent", "nesting::child"]))
+        .unwrap();
 
     let result = parent();
 
@@ -194,11 +228,13 @@ fn nested_spans_share_a_trace_and_correct_parent() {
 
 #[test]
 fn disabling_parent_does_not_suppress_enabled_child() {
-    let exporter = setup();
+    let (instr, exporter) = instr("A");
     // Only the child is enabled -- the parent function still runs (and still
     // calls the child) but must not itself be wrapped in a span, and must not
     // prevent the child's span from being recorded.
-    stylus::config::enable_encoded(&encode_names(&["nesting::child"])).unwrap();
+    instr
+        .enable_encoded(&encode_names(&["nesting::child"]))
+        .unwrap();
 
     let result = parent();
 
@@ -210,8 +246,10 @@ fn disabling_parent_does_not_suppress_enabled_child() {
 
 #[test]
 fn method_inside_impl_block_is_instrumented() {
-    let exporter = setup();
-    stylus::config::enable_encoded(&encode_names(&["widget::render"])).unwrap();
+    let (instr, exporter) = instr("A");
+    instr
+        .enable_encoded(&encode_names(&["widget::render"]))
+        .unwrap();
 
     let result = Widget.render();
 
@@ -222,14 +260,17 @@ fn method_inside_impl_block_is_instrumented() {
 }
 
 #[test]
-fn set_enabled_replaces_the_active_subset() {
-    let exporter = setup();
-    stylus::config::enable_encoded(&encode_names(&[
-        concat!(module_path!(), "::plain"),
-        "custom.span",
-    ]))
-    .unwrap();
-    stylus::config::set_enabled_encoded(&encode_names(&["custom.span"])).unwrap();
+fn set_enabled_encoded_replaces_the_active_subset() {
+    let (instr, exporter) = instr("A");
+    instr
+        .enable_encoded(&encode_names(&[
+            concat!(module_path!(), "::plain"),
+            "custom.span",
+        ]))
+        .unwrap();
+    instr
+        .set_enabled_encoded(&encode_names(&["custom.span"]))
+        .unwrap();
 
     plain(1);
     named();
@@ -244,9 +285,7 @@ fn set_enabled_replaces_the_active_subset() {
 // should show up here even without being invoked in this test.
 #[test]
 fn registry_discovers_all_traceable_functions_in_this_binary() {
-    setup();
-
-    let names: std::collections::HashSet<_> = stylus::config::all_names().collect();
+    let names: std::collections::HashSet<_> = stylus::catalog::all_names().collect();
     assert!(names.contains("custom.span"));
     assert!(names.contains("nesting::parent"));
     assert!(names.contains("nesting::child"));
@@ -255,19 +294,21 @@ fn registry_discovers_all_traceable_functions_in_this_binary() {
 
 #[test]
 fn enabled_names_reflects_the_active_subset() {
-    setup();
-    stylus::config::enable_encoded(&encode_names(&["nesting::parent", "nesting::child"])).unwrap();
+    let (instr, _exporter) = instr("A");
+    instr
+        .enable_encoded(&encode_names(&["nesting::parent", "nesting::child"]))
+        .unwrap();
 
-    let enabled: std::collections::HashSet<_> = stylus::config::enabled_names().collect();
+    let enabled: std::collections::HashSet<_> = instr.enabled_names().collect();
     assert_eq!(enabled, ["nesting::parent", "nesting::child"].into());
 }
 
 #[test]
 fn set_enabled_encoded_toggles_spans_via_an_encoded_id_list() {
-    let exporter = setup();
+    let (instr, exporter) = instr("A");
     let encoded = encode_names(&["nesting::child"]);
 
-    stylus::config::set_enabled_encoded(&encoded).unwrap();
+    instr.set_enabled_encoded(&encoded).unwrap();
     let result = parent();
 
     assert_eq!(result, 7);
@@ -278,12 +319,12 @@ fn set_enabled_encoded_toggles_spans_via_an_encoded_id_list() {
 
 #[test]
 fn enable_and_disable_encoded_are_additive_and_subtractive() {
-    let exporter = setup();
+    let (instr, exporter) = instr("A");
     let both = encode_names(&["nesting::parent", "nesting::child"]);
     let just_parent = encode_names(&["nesting::parent"]);
 
-    stylus::config::enable_encoded(&both).unwrap();
-    stylus::config::disable_encoded(&just_parent).unwrap();
+    instr.enable_encoded(&both).unwrap();
+    instr.disable_encoded(&just_parent).unwrap();
     let result = parent();
 
     assert_eq!(result, 7);
@@ -294,13 +335,12 @@ fn enable_and_disable_encoded_are_additive_and_subtractive() {
 
 #[test]
 fn set_enabled_encoded_rejects_a_corrupt_encoded_id_list() {
-    setup();
-    assert!(stylus::config::set_enabled_encoded("not a valid list!!").is_err());
+    let (instr, _exporter) = instr("A");
+    assert!(instr.set_enabled_encoded("not a valid list!!").is_err());
 }
 
 #[test]
 fn catalog_reports_every_traceable_function_with_a_matching_id() {
-    setup();
     // Touch every traceable fn once so its local static is linked in.
     let _ = plain(0);
     named();
@@ -328,7 +368,7 @@ fn catalog_reports_every_traceable_function_with_a_matching_id() {
         "widget::render",
     ] {
         assert!(by_name.contains_key(name), "{name} missing from catalog");
-        let decoded = stylus::config::decode(&encode_names(&[name])).unwrap();
+        let decoded = stylus::codec::decode(&encode_names(&[name])).unwrap();
         assert_eq!(decoded, vec![by_name[name]]);
     }
 
@@ -338,13 +378,81 @@ fn catalog_reports_every_traceable_function_with_a_matching_id() {
     assert!(parsed["functions"].as_array().unwrap().len() >= catalog.functions.len());
 }
 
+// --- In-process only: `Context`'s span slot is never read or written ---------
+
+#[test]
+fn spans_never_land_in_the_ambient_context_span_slot() {
+    let (instr, exporter) = instr("A");
+    instr
+        .enable_encoded(&encode_names(&["probe::ambient"]))
+        .unwrap();
+
+    // The probe reports what it sees in `Context::current().span()` from inside
+    // its own traced body. A span *was* created for it (asserted below), but it
+    // lives in the extension envelope, so the span slot stays empty -- which is
+    // exactly why outbound `traceparent` injection carries nothing from stylus.
+    let saw_ambient_span = probe_ambient();
+
+    assert!(
+        !saw_ambient_span,
+        "an instrumentation's span must not occupy Context's span slot"
+    );
+    assert_eq!(exporter.get_finished_spans().unwrap().len(), 1);
+}
+
+#[test]
+fn does_not_join_an_ambient_incoming_parent() {
+    let (instr, exporter) = instr("A");
+    instr
+        .enable_encoded(&encode_names(&["nesting::parent"]))
+        .unwrap();
+
+    // Stands in for a propagator-extracted incoming `traceparent`, or a web
+    // framework's server span: a valid span context in the ambient span slot.
+    let remote = SpanContext::new(
+        TraceId::from_bytes([
+            0x0b, 0xad, 0xc0, 0xde, 0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+            0x07, 0x08,
+        ]),
+        SpanId::from_bytes([0, 0, 0, 0, 0, 0, 0, 0x42]),
+        TraceFlags::SAMPLED,
+        true,
+        Default::default(),
+    );
+    let guard = Context::current()
+        .with_remote_span_context(remote.clone())
+        .attach();
+
+    let _ = parent();
+    drop(guard);
+
+    let spans = exporter.get_finished_spans().unwrap();
+    assert_eq!(spans.len(), 1);
+    assert_ne!(
+        spans[0].span_context.trace_id(),
+        remote.trace_id(),
+        "instrumentations root their own trace rather than joining the ambient one"
+    );
+    assert_eq!(
+        spans[0].parent_span_id,
+        SpanId::INVALID,
+        "the ambient remote parent must not be adopted"
+    );
+}
+
+// --- Child-only mode -------------------------------------------------------
+
 #[test]
 fn child_only_creates_no_span_without_an_active_parent() {
-    let exporter = setup();
-    // Enabled AND put in child-only mode, but called directly with no ambient
-    // span -- must stay silent, not become an orphan root.
-    stylus::config::enable_encoded(&encode_names(&["shared::leaf"])).unwrap();
-    stylus::config::set_child_only_encoded(&encode_names(&["shared::leaf"])).unwrap();
+    let (instr, exporter) = instr("A");
+    // Enabled AND put in child-only mode, but called directly with no active
+    // parent for this instrumentation -- must stay silent, not orphan a root.
+    instr
+        .enable_encoded(&encode_names(&["shared::leaf"]))
+        .unwrap();
+    instr
+        .set_child_only_encoded(&encode_names(&["shared::leaf"]))
+        .unwrap();
 
     let result = shared_leaf();
 
@@ -354,9 +462,13 @@ fn child_only_creates_no_span_without_an_active_parent() {
 
 #[test]
 fn child_only_nests_correctly_under_an_active_parent() {
-    let exporter = setup();
-    stylus::config::enable_encoded(&encode_names(&["shared::root", "shared::leaf"])).unwrap();
-    stylus::config::set_child_only_encoded(&encode_names(&["shared::leaf"])).unwrap();
+    let (instr, exporter) = instr("A");
+    instr
+        .enable_encoded(&encode_names(&["shared::root", "shared::leaf"]))
+        .unwrap();
+    instr
+        .set_child_only_encoded(&encode_names(&["shared::leaf"]))
+        .unwrap();
 
     let result = shared_root();
 
@@ -370,12 +482,16 @@ fn child_only_nests_correctly_under_an_active_parent() {
 
 #[test]
 fn child_only_mode_still_respects_the_enabled_flag() {
-    let exporter = setup();
+    let (instr, exporter) = instr("A");
     // Root enabled, leaf's own flag left off -- child-only only relaxes the
     // "needs a parent" requirement, it doesn't bypass the function's own
     // enabled flag.
-    stylus::config::enable_encoded(&encode_names(&["shared::root"])).unwrap();
-    stylus::config::set_child_only_encoded(&encode_names(&["shared::leaf"])).unwrap();
+    instr
+        .enable_encoded(&encode_names(&["shared::root"]))
+        .unwrap();
+    instr
+        .set_child_only_encoded(&encode_names(&["shared::leaf"]))
+        .unwrap();
 
     let result = shared_root();
 
@@ -390,10 +506,12 @@ fn child_only_is_a_runtime_mode_the_same_fn_can_root_or_not() {
     // The same enabled function roots a trace when *not* in child-only mode,
     // and stays silent (no orphan) when it *is* -- the whole point of making
     // child-only a runtime decision rather than a source annotation.
-    let exporter = setup();
+    let (instr, exporter) = instr("A");
 
     // Not child-only: called directly, it roots its own span.
-    stylus::config::enable_encoded(&encode_names(&["shared::leaf"])).unwrap();
+    instr
+        .enable_encoded(&encode_names(&["shared::leaf"]))
+        .unwrap();
     assert_eq!(shared_leaf(), 5);
     let spans = exporter.get_finished_spans().unwrap();
     assert_eq!(spans.len(), 1);
@@ -401,17 +519,23 @@ fn child_only_is_a_runtime_mode_the_same_fn_can_root_or_not() {
 
     // Flip the same function into child-only mode: now it suppresses itself.
     exporter.reset();
-    stylus::config::set_child_only_encoded(&encode_names(&["shared::leaf"])).unwrap();
+    instr
+        .set_child_only_encoded(&encode_names(&["shared::leaf"]))
+        .unwrap();
     assert_eq!(shared_leaf(), 5);
     assert!(exporter.get_finished_spans().unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn child_only_works_for_async_functions_too() {
-    let exporter = setup();
+    let (instr, exporter) = instr("A");
 
-    stylus::config::enable_encoded(&encode_names(&["shared::async_leaf"])).unwrap();
-    stylus::config::set_child_only_encoded(&encode_names(&["shared::async_leaf"])).unwrap();
+    instr
+        .enable_encoded(&encode_names(&["shared::async_leaf"]))
+        .unwrap();
+    instr
+        .set_child_only_encoded(&encode_names(&["shared::async_leaf"]))
+        .unwrap();
     let result = shared_async_leaf().await;
     assert_eq!(result, 5);
     assert!(
@@ -419,7 +543,8 @@ async fn child_only_works_for_async_functions_too() {
         "async child-only fn must not orphan without an active parent"
     );
 
-    stylus::config::enable_encoded(&encode_names(&["shared::async_root", "shared::async_leaf"]))
+    instr
+        .enable_encoded(&encode_names(&["shared::async_root", "shared::async_leaf"]))
         .unwrap();
     let result = shared_async_root().await;
     assert_eq!(result, 5);
@@ -438,11 +563,12 @@ async fn child_only_works_for_async_functions_too() {
 
 #[test]
 fn child_only_names_reflects_the_configured_set() {
-    setup();
+    let (instr, _exporter) = instr("A");
 
-    stylus::config::set_child_only_encoded(&encode_names(&["shared::leaf", "shared::async_leaf"]))
+    instr
+        .set_child_only_encoded(&encode_names(&["shared::leaf", "shared::async_leaf"]))
         .unwrap();
-    let names: std::collections::HashSet<_> = stylus::config::child_only_names().collect();
+    let names: std::collections::HashSet<_> = instr.child_only_names().collect();
 
     assert!(names.contains("shared::leaf"));
     assert!(names.contains("shared::async_leaf"));
@@ -451,27 +577,10 @@ fn child_only_names_reflects_the_configured_set() {
 
 // --- Multiple, independently-configured instrumentations -------------------
 
-/// Build a named instrumentation with its own in-memory exporter/provider.
-/// The returned exporter observes only that instrumentation's spans; the
-/// tracer keeps its provider alive for the instrumentation's lifetime.
-fn named_instr(name: &'static str) -> (Instrumentation, InMemorySpanExporter) {
-    let exporter = InMemorySpanExporter::default();
-    let provider = SdkTracerProvider::builder()
-        .with_simple_exporter(exporter.clone())
-        .build();
-    let instr = Instrumentation::builder()
-        .name(name)
-        .tracer(provider.tracer(name))
-        .build()
-        .expect("a free instrumentation slot");
-    (instr, exporter)
-}
-
 #[test]
 fn two_instrumentations_isolate_their_spans_and_traces() {
-    setup();
-    let (a, exp_a) = named_instr("A");
-    let (b, exp_b) = named_instr("B");
+    let (a, exp_a) = instr("A");
+    let (b, exp_b) = instr("B");
 
     // Overlapping enabled sets: both trace the parent, only A traces the child.
     a.enable_encoded(&encode_names(&["nesting::parent", "nesting::child"]))
@@ -499,9 +608,8 @@ fn two_instrumentations_isolate_their_spans_and_traces() {
 
 #[test]
 fn each_instrumentation_nests_independently() {
-    setup();
-    let (a, exp_a) = named_instr("A");
-    let (b, exp_b) = named_instr("B");
+    let (a, exp_a) = instr("A");
+    let (b, exp_b) = instr("B");
 
     // A traces one parent/child pair, B a different one.
     a.enable_encoded(&encode_names(&["nesting::parent", "nesting::child"]))
@@ -528,37 +636,36 @@ fn each_instrumentation_nests_independently() {
 }
 
 #[test]
-fn default_and_named_coexist_with_independent_traces() {
-    let exp_default = setup();
-    let (named, exp_named) = named_instr("N");
+fn the_same_function_traced_by_two_instrumentations_yields_separate_traces() {
+    let (a, exp_a) = instr("A");
+    let (b, exp_b) = instr("B");
 
-    // The same function enabled in both the default instrumentation and a named
-    // one -- each produces its own span in its own tracer/backend.
-    stylus::config::enable_encoded(&encode_names(&["nesting::parent"])).unwrap();
-    named
-        .enable_encoded(&encode_names(&["nesting::parent"]))
+    // The same function enabled in both -- each produces its own span in its
+    // own tracer/backend, in its own trace.
+    a.enable_encoded(&encode_names(&["nesting::parent"]))
+        .unwrap();
+    b.enable_encoded(&encode_names(&["nesting::parent"]))
         .unwrap();
 
     let _ = parent();
 
-    let sd = exp_default.get_finished_spans().unwrap();
-    let sn = exp_named.get_finished_spans().unwrap();
-    assert_eq!(sd.len(), 1);
-    assert_eq!(sn.len(), 1);
-    assert_eq!(sd[0].name, "nesting::parent");
-    assert_eq!(sn[0].name, "nesting::parent");
+    let sa = exp_a.get_finished_spans().unwrap();
+    let sb = exp_b.get_finished_spans().unwrap();
+    assert_eq!(sa.len(), 1);
+    assert_eq!(sb.len(), 1);
+    assert_eq!(sa[0].name, "nesting::parent");
+    assert_eq!(sb[0].name, "nesting::parent");
     assert_ne!(
-        sd[0].span_context.trace_id(),
-        sn[0].span_context.trace_id(),
-        "default and named instrumentations build separate traces"
+        sa[0].span_context.trace_id(),
+        sb[0].span_context.trace_id(),
+        "each instrumentation builds a separate trace"
     );
 }
 
 #[test]
 fn child_only_is_per_instrumentation() {
-    setup();
-    let (a, exp_a) = named_instr("A");
-    let (b, exp_b) = named_instr("B");
+    let (a, exp_a) = instr("A");
+    let (b, exp_b) = instr("B");
 
     // Both enable the shared leaf; A puts it in child-only mode, B leaves it
     // root-capable. Called directly (no parent), A must suppress it, B must not.
@@ -579,9 +686,8 @@ fn child_only_is_per_instrumentation() {
 }
 
 #[test]
-fn dropping_an_instrumentation_stops_new_spans_and_frees_reuse() {
-    setup();
-    let (a, exp_a) = named_instr("A");
+fn dropping_an_instrumentation_stops_new_spans_and_frees_its_slot() {
+    let (a, exp_a) = instr("A");
     a.enable_encoded(&encode_names(&["nesting::parent"]))
         .unwrap();
     let _ = parent();
@@ -595,18 +701,36 @@ fn dropping_an_instrumentation_stops_new_spans_and_frees_reuse() {
         "no new spans for a dropped instrumentation's slot"
     );
 
-    // A fresh instrumentation still allocates cleanly and works.
-    let (c, exp_c) = named_instr("C");
+    // A fresh instrumentation still allocates cleanly and works -- and since the
+    // dropped one released its slot, this may well be the very same slot.
+    let (c, exp_c) = instr("C");
     c.enable_encoded(&encode_names(&["nesting::parent"]))
         .unwrap();
     let _ = parent();
     assert_eq!(exp_c.get_finished_spans().unwrap().len(), 1);
 }
 
+#[test]
+fn slots_are_reused_so_churn_does_not_exhaust_them() {
+    // Build and drop well past MAX_INSTRUMENTATIONS one at a time. With a bump
+    // allocator this would fail partway through; with slot reuse it can't.
+    let total = stylus::instrumentation::MAX_INSTRUMENTATIONS * 3;
+    for i in 0..total {
+        let (one, exporter) = instr("churn");
+        one.enable_encoded(&encode_names(&["nesting::child"]))
+            .unwrap();
+        let _ = child();
+        assert_eq!(
+            exporter.get_finished_spans().unwrap().len(),
+            1,
+            "instrumentation #{i} of {total} should still trace"
+        );
+    }
+}
+
 #[tokio::test]
-async fn named_instrumentation_works_across_await_points() {
-    setup();
-    let (a, exp_a) = named_instr("A");
+async fn instrumentation_works_across_await_points() {
+    let (a, exp_a) = instr("A");
     a.enable_encoded(&encode_names(&["shared::async_root", "shared::async_leaf"]))
         .unwrap();
 

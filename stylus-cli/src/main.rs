@@ -1,5 +1,5 @@
 //! Standalone helper to turn a list of trace-site ids into a compact encoded
-//! string for `stylus::config::set_enabled_encoded` (and friends) -- no Rust
+//! string for `Instrumentation::set_enabled_encoded` (and friends) -- no Rust
 //! required on the caller's side, just this binary.
 //!
 //! This tool only encodes the ids it's given; it has no access to any
@@ -28,7 +28,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Encode a list of trace-site ids into a compact, lossless string for
-    /// `stylus::config::set_enabled_encoded` (and friends).
+    /// `Instrumentation::set_enabled_encoded` (and friends).
     ///
     /// Reads ids from stdin (whitespace/newline separated) if --ids is not
     /// given. This tool is standalone: it only encodes the ids it's given, and

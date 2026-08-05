@@ -51,7 +51,8 @@ impl std::fmt::Display for DecodeError {
 impl std::error::Error for DecodeError {}
 
 /// Encode a set of trace-site ids into a compact, lossless string suitable for
-/// [`crate::config::set_enabled_encoded`] (and friends).
+/// [`Instrumentation::set_enabled_encoded`](crate::instrumentation::Instrumentation::set_enabled_encoded)
+/// (and friends).
 ///
 /// `ids` is sorted in place. A duplicate id encodes as a zero delta and
 /// decodes back as a repeat, so callers that need set semantics (as
@@ -71,8 +72,8 @@ pub fn encode(ids: &mut [u64]) -> String {
 
 /// Decode a string produced by [`encode`] back into the sorted list of ids it
 /// carries. The inverse of [`encode`]; used by
-/// [`crate::config::set_enabled_encoded`] and the per-instrumentation
-/// equivalents to figure out which trace sites to toggle.
+/// [`crate::instrumentation`]'s `*_encoded` methods to figure out which trace
+/// sites to toggle.
 pub fn decode(encoded: &str) -> Result<Vec<u64>, DecodeError> {
     let bytes = URL_SAFE_NO_PAD
         .decode(encoded)

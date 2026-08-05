@@ -7,106 +7,177 @@ without recompiling.
 
 ## Quick start
 
+Annotate the functions you might one day want traced:
+
 ```rust
 use stylus::traceable;
 
 #[traceable]
 fn process() { /* ... */ }
 
-#[traceable(name = "kafka.fetch", tracer = "my-service")]
+#[traceable(name = "kafka.fetch")]
 async fn fetch() { /* ... */ }
 
 #[traceable(fields("component" = "proxy", "request_id" = id.clone()))]
 async fn handle(id: String) { /* ... */ }
 ```
 
-Every `#[traceable]` function is disabled by default. When disabled, a call costs a single
-atomic load — no span, no `opentelemetry::Context` work at all. When enabled, span
-creation and context propagation work exactly like manual `opentelemetry` instrumentation:
-parent/child nesting is automatic via `opentelemetry::Context`'s ambient current-context
-mechanism (attach/detach for sync, `FutureExt::with_context` across `.await` for async).
-Disabling a function only skips *its own* span — it doesn't touch the ambient context, so an
-enabled child still attaches correctly to the nearest actual open ancestor span, whether or not
-everything in between is enabled.
+Nothing traces yet. An **`Instrumentation`** is the only way to turn tracing on — there is no
+global or default instrumentation, and no process-wide tracer. Each `Instrumentation` brings its
+own `Tracer`, holds its own enabled subset, and builds its own isolated span hierarchy:
 
-Registry key (the string you enable/disable by) defaults to `module_path!() + "::" + fn_name`,
-or the `name` argument if given. Note this isn't qualified by a surrounding `impl` type — two
-methods with the same name in the same module share a key unless `name` disambiguates them.
+```rust
+use opentelemetry::trace::TracerProvider as _;
+use stylus::instrumentation::Instrumentation;
+
+let provider = /* your own opentelemetry_sdk::trace::SdkTracerProvider */;
+
+let instr = Instrumentation::builder()
+    .name("checkout-debug")                     // diagnostic only
+    .tracer(provider.tracer("checkout-debug"))  // any opentelemetry Tracer; required
+    .build()?;                                  // Err(SlotsExhausted) if 64 are already live
+
+instr.set_enabled_encoded(&encoded)?; // a compact id list — see "Compact subset encoding"
+```
+
+Dropping `instr` stops new spans for it and releases its slot for reuse; spans already in flight
+finish and export normally.
+
+Every `#[traceable]` function is disabled for every instrumentation by default. When no
+instrumentation is tracing a function, a call costs a single atomic load — no span, no
+`opentelemetry::Context` work at all. When at least one is, the macro builds one child span per
+active instrumentation and attaches a single context for the wrapped call (attach/detach for sync,
+`FutureExt::with_context` across `.await` for async), so in-process parent/child nesting is
+automatic, including across `.await` points.
+
+Disabling a function only skips *its own* span — an enabled function still nests under the nearest
+recording ancestor span **of the same instrumentation**, whether or not everything in between is
+enabled.
+
+Registry key (the string a function is listed under, and the id you configure by) defaults to
+`module_path!() + "::" + fn_name`, or the `name` argument if given. Note this isn't qualified by a
+surrounding `impl` type — two methods with the same name in the same module share a key unless
+`name` disambiguates them.
+
+The macro takes only `name` and `fields(...)`. There is deliberately no `tracer` argument: a call
+site never names or looks up a tracer, because each instrumentation supplies its own.
+
+## Configuring an instrumentation
+
+An instrumentation is configured exclusively through compact encoded id lists (see
+[Compact subset encoding](#compact-subset-encoding) below for how `encoded` is produced) — there's
+no name-based way to enable/disable. A name list doesn't scale as a wire format: 100 names out of a
+100,000-function registry is 4-6 KB of configuration just to select 0.1% of it, so encoded ids are
+the only way in.
+
+```rust
+instr.set_enabled_encoded(&encoded)?;    // replace the whole enabled set
+instr.enable_encoded(&encoded)?;         // additive
+instr.disable_encoded(&encoded)?;        // subtractive
+instr.enable_all();                      // every registered function
+instr.disable_all();                     // none
+
+instr.set_child_only_encoded(&encoded)?; // replace the child-only set
+
+instr.enabled_names();                   // -> impl Iterator<Item = &'static str>, read-only
+instr.child_only_names();                // -> impl Iterator<Item = &'static str>, read-only
+
+stylus::catalog::all_names();            // -> every registered key, regardless of instrumentation
+```
+
+`enabled_names` / `child_only_names` are introspection only — configuration always goes in as
+encoded ids. `all_names()` lives on the catalog, not on a handle, because the set of linked
+`#[traceable]` functions is a property of the binary.
+
+### Running several at once
+
+There's exactly one mechanism, so "several instrumentations in parallel" is just the general case of
+what's above rather than a separate feature. Create as many as you need — each with its own enabled
+subset, its own child-only set, and its own `Tracer` (potentially a different backend):
+
+```rust
+let checkout = Instrumentation::builder()
+    .name("checkout-debug")
+    .tracer(checkout_provider.tracer("checkout-debug"))
+    .build()?;
+let db_audit = Instrumentation::builder()
+    .name("db-audit")
+    .tracer(audit_provider.tracer("db-audit"))
+    .build()?;
+
+checkout.set_enabled_encoded(&checkout_subset)?;
+db_audit.set_enabled_encoded(&db_subset)?;
+```
+
+Each builds a fully independent trace from the same physical call chain: a function enabled for
+both produces two spans, one per instrumentation, each parented within its own hierarchy. The
+disabled fast path is unchanged — the extra machinery is paid only on calls where at least one
+instrumentation is actually active.
+
+`MAX_INSTRUMENTATIONS = 64` bounds how many may be **live at once**, not how many may be created
+over the process lifetime: each handle owns one bit per `#[traceable]` site, and `Drop` releases
+its slot to a free list for reuse. That matters for hot-reload, where an instrumentation is torn
+down and rebuilt whenever its identity (tracer, endpoint) changes. `build()` returns
+`Err(SlotsExhausted)` only when 64 are concurrently live.
+
+Slot reuse leaves one narrow, accepted race: `Drop` clears its bit across many sites
+non-atomically, and a traced call reads a site's mask before reading the slot table. A thread
+descheduled between those two reads, across an *entire* drop and rebuild, could find the new
+occupant's tracer behind a bit the old occupant set and emit one span into the wrong
+instrumentation. Closing it properly would need epoch-based reclamation plus hot-path validation;
+the cost of losing the race is a single mis-attributed span during a reload, which isn't worth that
+machinery. See [`docs/multi-instrumentation.md`](docs/multi-instrumentation.md) for the design.
+
+## Limitation: in-process only
+
+Instrumentations never read or write `opentelemetry::Context`'s single "current span" slot — their
+spans live exclusively in a `Context` extension envelope, one entry per active slot, so async
+propagation stays O(1) no matter how many instrumentations are live. Distributed propagation is
+dropped deliberately as a consequence:
+
+- **An incoming `traceparent` is not joined.** A propagator deposits the remote parent in
+  `Context`'s span slot, which no instrumentation consults, so the first traced function on a call
+  path always roots a fresh trace.
+- **A span created outside stylus is never a parent** either — not a web framework's server span,
+  not a hand-rolled `tracer.start()`.
+- **Outbound requests carry no `traceparent` from stylus**, since propagators inject whatever is in
+  that same span slot.
+
+An instrumentation's spans nest only under other `#[traceable]` spans of that *same*
+instrumentation. In-process nesting, including across `.await`, works correctly.
 
 ## Avoiding orphan spans for functions shared across call paths
 
-A function's `enabled` flag is global — it fires for *every* caller, not just the one you had
-in mind. That's fine for a function with one call site, but a function shared across multiple
-call paths (a common `db`/`cache`/logging-style helper called from several different flows)
-will also fire — as a disconnected root span — every time some *other*, non-traced path calls
-it too, since disabling doesn't touch the ambient context and there's nothing above it to
-attach to.
+A function's enabled bit is per-instrumentation but not per-call-site: it fires for *every* caller,
+not just the one you had in mind. That's fine for a function with one call site, but a function
+shared across multiple call paths (a common `db`/`cache`/logging-style helper called from several
+different flows) will also fire — as a disconnected root span — every time some *other*, non-traced
+path calls it, since there's nothing above it in that instrumentation's hierarchy to attach to.
 
-The fix is *child-only mode*: a function in this mode only creates a span when it's called from
-within an already-active (recording) span — never a root, even when enabled.
+The fix is *child-only mode*: for a given instrumentation, a function in this mode only creates a
+span when that instrumentation already has a recording span on the current call path — never a
+root, even when enabled.
 
 ```rust
-stylus::config::set_child_only_encoded(&encoded)?; // same compact id list as the enabled set
+instr.set_child_only_encoded(&encoded)?; // same compact id list as the enabled set
 ```
 
-Crucially this is **not** a source annotation — it's set at runtime, because whether a shared
-helper *should* root a trace depends on what you're tracing. Tracing the flow that calls it?
-Put it in child-only mode so it stays nested and never orphans on the *other* flows. Tracing
-the helper's own subsystem (e.g. "trace the database")? Leave it root-capable so it still
-produces a trace even when its immediate caller isn't traced. It only changes *when* a span is
-created, not whether — still zero false negatives on the path you enabled, still the same
-near-zero cost when off.
+Child-only is orthogonal to enabled, and scoped to one instrumentation: a function must be enabled
+for that instrumentation to trace at all, and being child-only *for that instrumentation*
+additionally suppresses it when it would otherwise root. The same function can be child-only for
+one instrumentation and root-capable for another.
+
+Crucially it's **not** a source annotation — it's set at runtime, because whether a shared helper
+*should* root a trace depends on what you're tracing. Tracing the flow that calls it? Put it in
+child-only mode so it stays nested and never orphans on the *other* flows. Tracing the helper's own
+subsystem (e.g. "trace the database")? Leave it root-capable so it still produces a trace even when
+its immediate caller isn't traced. It only changes *when* a span is created, not whether — still
+zero false negatives on the path you enabled, still the same near-zero cost when off.
 
 Deciding which functions to put in child-only mode for a given request is mechanical given a
 call graph: a function should be child-only exactly when one of its own callers is also being
 traced (so it always has a parent), and root-capable otherwise. That's what `stylus-cli graph`
 and the agent workflow below automate.
-
-## Configuring what's enabled
-
-The default instrumentation is configured exclusively through compact encoded id lists (see
-[Compact subset encoding](#compact-subset-encoding) below for how `encoded` is produced) — there's
-no name-based way to enable/disable it. A name list doesn't scale as a wire format: 100 names out
-of a 100,000-function registry is 4-6 KB of configuration just to select 0.1% of it, so encoded
-ids are the only way in.
-
-```rust
-stylus::config::enable_encoded(&encoded)?;
-stylus::config::disable_encoded(&encoded)?;
-stylus::config::set_enabled_encoded(&encoded)?; // replace the whole active set
-stylus::config::enable_all();
-stylus::config::disable_all();
-stylus::config::all_names(); // -> every registered key, for introspection
-stylus::config::enabled_names(); // -> those currently enabled
-
-stylus::config::set_child_only_encoded(&encoded)?; // replace the child-only set
-stylus::config::child_only_names(); // -> those currently in child-only mode
-```
-
-Named instrumentations (next section) are configured the same way, through encoded id lists.
-
-## Multiple parallel instrumentations
-
-Everything above drives the single, always-present **default instrumentation**. On top of it you
-can create named instrumentations at runtime — each with its own enabled subset, its own isolated
-span hierarchy over the same call flow, and its own `Tracer` (potentially a different backend):
-
-```rust
-let checkout = stylus::instrumentation::Instrumentation::builder()
-    .name("checkout-debug")
-    .tracer(provider.tracer("checkout-debug")) // any opentelemetry Tracer
-    .build()?;
-checkout.enable_encoded(&encoded)?;
-// ... same enable/disable/set_child_only_encoded/enable_all/disable_all API as `stylus::config`,
-// scoped to this handle. Dropping `checkout` stops new spans for it and frees the slot.
-```
-
-The default and each named instrumentation build fully independent traces from the same physical
-call chain. The disabled and default-only fast paths are unchanged — the extra machinery is paid
-only on calls where a named instrumentation is actually active. Up to 64 concurrent
-instrumentations; named ones are in-process only (the default owns downstream `traceparent`
-propagation). See [`docs/multi-instrumentation.md`](docs/multi-instrumentation.md) for the design
-and the measured no-regression numbers.
 
 ## Compact subset encoding
 
@@ -118,9 +189,9 @@ are toggled, nothing else.
 ```rust
 let mut ids = vec![0, 3, 7];
 let encoded = stylus::codec::encode(&mut ids);
-stylus::config::set_enabled_encoded(&encoded)?;   // replace, like set_enabled
-stylus::config::enable_encoded(&encoded)?;        // additive, like enable
-stylus::config::disable_encoded(&encoded)?;       // subtractive, like disable
+instr.set_enabled_encoded(&encoded)?;   // replace the whole enabled set
+instr.enable_encoded(&encoded)?;        // additive
+instr.disable_encoded(&encoded)?;       // subtractive
 ```
 
 An `id` is a `#[traceable]` function's **index in the registry** (`stylus::registry::REGISTRY`):
@@ -131,12 +202,14 @@ regenerated. That's the deliberate trade for losslessness: there's no build-inde
 hash, but the encoding is exact and compact (deltas of a sorted dense index stay tiny). Sorting
 is done in place, which is why `encode` takes `&mut [u64]`. Decoding is
 `stylus::codec::decode(&str) -> Result<Vec<u64>, stylus::codec::DecodeError>`; a corrupt string
-returns `Err(DecodeError)` and leaves state unchanged. Both are re-exported as
-`stylus::config::encode` / `stylus::config::decode` / `stylus::config::DecodeError`.
+returns `Err(DecodeError)` and leaves state unchanged.
 
-To enable *everything* without enumerating every id from code, call
-`stylus::config::enable_all()`. For a config-file-driven setup, encode every id from the catalog
-instead. "Disable everything" is still just an empty enabled string.
+Ids are build-scoped, not instrumentation-scoped: the same encoded string means the same set of
+functions for every instrumentation in that binary.
+
+To enable *everything* without enumerating every id from code, call `instr.enable_all()`. For a
+config-file-driven setup, encode every id from the catalog instead. "Disable everything" is still
+just an empty enabled string.
 
 ## Letting an LLM (or a script) configure an arbitrary subset
 
@@ -174,7 +247,8 @@ reasonably be handed a plain name list:
    let encoded = stylus::codec::encode(&mut ids);
    ```
    or without writing any Rust at all, via the CLI (see below).
-4. **Apply it**: `stylus::config::set_enabled_encoded(&encoded)?`.
+4. **Apply it** to the instrumentation that should trace that subset:
+   `instr.set_enabled_encoded(&encoded)?`.
 
 ### The encoding, if you need to reproduce it without this crate
 
@@ -250,27 +324,44 @@ than trying to generate it themselves. See `stylus-demo/AGENTS.md` and
 ## Crate layout
 
 - `stylus` — runtime: `#[traceable]` re-export, `registry` (the `linkme`-collected
-  `TraceSite`/`REGISTRY`), `config` (enable/disable, exact and encoded), `codec` (lossless
-  delta-encoded id list encode/decode), `catalog` (the `{name, id}` dump).
+  `TraceSite`/`REGISTRY`, one enabled/child-only bitmask pair per site), `instrumentation`
+  (`Instrumentation` + its builder — creating, configuring, and dropping instrumentations, plus
+  the `start_spans` hot path), `codec` (lossless delta-encoded id list encode/decode),
+  `catalog` (the `{name, id}` dump and `all_names`).
 - `stylus-macros` — the `#[traceable]` proc-macro implementation.
 - `stylus-cli` — the standalone binary described above (built with `clap`): `encode` (ids
   → encoded id list) and `graph` (source → call-graph edges, via `syn`).
 
 ## Benchmarks
 
-`stylus/benches/traceable_overhead.rs` (Criterion) compares the same CPU-bound workload across
-three shapes: a plain function with no macro, `#[traceable]` with tracing disabled, and
-`#[traceable]` with tracing actually enabled (a real in-process span exporter, not a no-op
-tracer). Run with `cargo bench -p stylus`. Representative local numbers:
+`stylus/benches/traceable_overhead.rs` (Criterion) runs the same CPU-bound workload (1000
+iterations) through a plain function, through `#[traceable]` with nothing tracing it, through
+`#[traceable]` with one and then two live instrumentations (real in-process span exporters, not
+no-op tracers), and through `#[tracing::instrument]` for comparison. Run with
+`cargo bench -p stylus`. Representative local numbers:
 
-| variant                        | time      |
-| ------------------------------ | --------- |
-| plain (no macro)                | ~865 ns  |
-| `#[traceable]`, disabled         | ~871 ns  |
-| `#[traceable]`, enabled           | ~1.26 µs |
+| variant                          | time      |
+| -------------------------------- | --------- |
+| `no_macro`                       | 862 ns    |
+| `traceable_disa` (mask == 0)     | 862 ns    |
+| `traceable_one_instr_enab`       | 1.245 µs  |
+| `traceable_one_instr_disa`       | 871 ns    |
+| `traceable_two_instr_enab`       | 1.488 µs  |
+| `traceable_two_instr_disa`       | 871 ns    |
+| `tracing_instrument_disa`        | 931 ns    |
+| `tracing_instrument_enab`        | 1.919 µs  |
 
-Disabled costs the same as no macro at all, within noise; enabled adds the real cost of span
-creation and export.
+With no instrumentation tracing a function, `#[traceable]` costs the same as no macro at all,
+within noise — the mask is `0` and the macro dispatch is a single atomic load followed by the raw
+body. Enabled adds the real cost of span construction and export, once per active instrumentation.
+
+Dropping the special-cased default instrumentation is a small, honest trade. Previously a
+hardcoded `mask == 1` path ran a single span against a process-global tracer at ~1.21 µs, so the
+single-instrumentation case now costs ~35 ns more (1.21 → 1.245 µs). In exchange the multi-slot
+path got *faster*, because `start_spans` no longer carries the slot-0 branch and its
+`slot0_cx`/`env_changed` bookkeeping: one named instrumentation went 1.29 → 1.245 µs and two went
+1.58 → 1.488 µs. One uniform path, slightly cheaper as soon as you have more than a single
+instrumentation.
 
 ## Development
 
@@ -282,10 +373,10 @@ mise run lint   # cargo fmt --all -- --check && cargo clippy --workspace --all-t
 ```
 
 Tests must be run via `cargo nextest run`, not plain `cargo test` — several tests mutate
-process-global state (the OTel tracer provider, the `linkme` registry), and rely on nextest's
-process-per-test isolation instead of a shared-process `Mutex`. Each crate with tests has a
-`check_test_runner` test that fails with a clear message if it detects it's running under plain
-`cargo test`.
+process-global state (the `linkme` registry's per-site bitmasks, which every instrumentation in
+the process shares), and rely on nextest's process-per-test isolation instead of a shared-process
+`Mutex`. Each crate with tests has a `check_test_runner` test that fails with a clear message if
+it detects it's running under plain `cargo test`.
 
 CI (`.github/workflows/ci.yml`) runs `rust-fmt`, `rust-clippy`, `rust-doc`, and `rust-test`
 (via `mise run test`) as separate jobs on every push/PR.

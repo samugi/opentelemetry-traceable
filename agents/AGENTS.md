@@ -28,6 +28,18 @@ registry, so ids (and any encoded value) are **specific to that build**: always 
 from the current binary. You compute both sets mechanically from the catalog graph. Nothing here
 requires understanding the code — it's graph traversal plus one membership rule.
 
+Two facts about how `stylus` applies these, because they constrain the sets you compute:
+
+- The two lists configure one `stylus` **instrumentation** (there is no global or default
+  instrumentation — nothing traces unless the app has created one and fed it these values), and
+  "already have an active parent span" always means *a span from that same instrumentation*. If
+  this app's config turns out to define **more than one** instrumentation, each with its own
+  `enabled`/`child_only` pair, stop and ask the user which one to change.
+- Only an enabled, **non**-child-only `#[traceable]` function can start a trace. `stylus` does not
+  join an incoming `traceparent`, and a span created outside `stylus` (a web framework's server
+  span, a hand-rolled `tracer.start()`) is never a parent. So never rely on some outer span to root
+  the trace: if every function in your selection ends up child-only, nothing spans at all.
+
 ## 1. Make sure `stylus-cli` is current
 
 Run `stylus-cli --help` and confirm it lists both `encode` and `graph`. Then
@@ -136,11 +148,14 @@ stylus-cli encode --ids <every id in E>          # -> enabled
 stylus-cli encode --ids <every id in CO>         # -> child_only
 ```
 
-Find the local YAML/JSON config — commonly `config.yaml`/`config.json` at the repo root, with
-`tracing.enabled` and `tracing.child_only`. **If it isn't obviously the right file/fields, ask
-the user — don't guess.** Set both fields (for a disable request, set both to `""`). This
-replaces whatever was there; if asked to *add* to what's currently on, include the
-previously-enabled ids in `E` too.
+Find the local YAML/JSON config — commonly `config.yaml`/`config.json` at the repo root. The two
+fields belong to **one instrumentation**: expect a list of them (e.g. `instrumentations:`), each
+entry with its own `enabled` and `child_only`. Target the entry the user named; if there's more
+than one and they didn't say which, **ask** — don't guess, and don't touch the other entries,
+their identity fields (`name`/`service_name`/`otlp_endpoint`), or anything outside the list.
+**If it isn't obviously the right file/fields, ask the user — don't guess.** Set both fields (for
+a disable request, set both to `""`). This replaces whatever was there; if asked to *add* to
+what's currently on, include the previously-enabled ids in `E` too.
 
 **Then re-read both fields and compare them character-for-character against what `encode`
 printed.** Don't report success until they match exactly. A value off by even one character is

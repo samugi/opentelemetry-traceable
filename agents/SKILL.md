@@ -27,6 +27,18 @@ An `id` is a function's index in the running binary's registry, so ids — and a
 built from them — are **specific to that build**: always use a catalog produced by the current
 binary, and regenerate it if the app's `#[traceable]` functions have changed.
 
+Two facts about how `stylus` applies these, because they constrain the sets you compute:
+
+- The pair configures one `stylus` **instrumentation** (there is no global or default one —
+  nothing traces unless the app created an instrumentation and fed it these values), and "already
+  have an active parent" always means *a span from that same instrumentation*. If this app's config
+  defines **more than one** instrumentation, each with its own `enabled`/`child_only` pair, stop and
+  ask the user which to change.
+- Only an enabled, **non**-child-only `#[traceable]` function can start a trace. `stylus` does not
+  join an incoming `traceparent`, and a span created outside `stylus` (a framework's server span, a
+  hand-rolled `tracer.start()`) is never a parent — so never count on an outer span to root the
+  trace. If everything in your selection ends up child-only, nothing spans at all.
+
 1. **Make sure `stylus-cli` is current.** Run `stylus-cli --help` and confirm it lists both
    `encode` and `graph`; then `stylus-cli encode --help` and confirm it takes `--ids`.
    - All present: continue.
@@ -99,10 +111,14 @@ binary, and regenerate it if the app's `#[traceable]` functions have changed.
    stylus-cli encode --ids <every id in E>     # -> enabled
    stylus-cli encode --ids <every id in CO>    # -> child_only
    ```
-   Find the local YAML/JSON config — commonly `config.yaml`/`config.json` at the repo root, with
-   `tracing.enabled` and `tracing.child_only`. **If it isn't obviously the right file/fields,
-   ask the user.** Set both (for a disable request, both `""`). This replaces what's there; to
-   _add_ to what's on, include the previously-enabled ids in `E` too.
+   Find the local YAML/JSON config — commonly `config.yaml`/`config.json` at the repo root. The
+   two fields belong to **one instrumentation**: expect a list of them (e.g.
+   `instrumentations:`), each entry with its own `enabled` and `child_only`. Target the entry the
+   user named; if there's more than one and they didn't say which, **ask**. Don't touch other
+   entries, their identity fields (`name`/`service_name`/`otlp_endpoint`), or anything outside
+   the list. **If it isn't obviously the right file/fields, ask the user.** Set both (for a
+   disable request, both `""`). This replaces what's there; to _add_ to what's on, include the
+   previously-enabled ids in `E` too.
 
    **Then re-read both fields and compare them character-for-character against what `encode`
    printed.** Don't report success until they match exactly. A value off by even one character

@@ -15,12 +15,11 @@ pub struct TraceSite {
     pub name: &'static str,
 
     /// Bitmask of which instrumentation slots currently have this function
-    /// enabled -- bit `N` corresponds to instrumentation slot `N` (bit 0 is
-    /// the always-present default instrumentation driven by `stylus::config`;
-    /// bits 1..64 are dynamically-created named [`crate::instrumentation`]s).
-    /// A function is traced by a slot iff that slot's bit is set here. The
-    /// disabled fast path is a single load of this word compared against zero,
-    /// so a function no instrumentation cares about costs one atomic load.
+    /// enabled -- bit `N` corresponds to the slot held by one live
+    /// [`crate::instrumentation::Instrumentation`]. A function is traced by a
+    /// slot iff that slot's bit is set here. The disabled fast path is a single
+    /// load of this word compared against zero, so a function no instrumentation
+    /// cares about costs one atomic load.
     pub enabled_mask: AtomicU64,
     /// Bitmask of which instrumentation slots have this function in
     /// *child-only* mode: for a slot whose bit is set here, this function only

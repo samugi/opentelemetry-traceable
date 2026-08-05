@@ -1,10 +1,12 @@
 //! Proc-macro implementation of `#[traceable]`.
 //!
-//! Uses an `#[in_span]`-style argument surface (`name`, `tracer`,
-//! `fields(key = expr, ...)`), but additionally gates span creation behind a
-//! per-function bitmask discovered at link time via `linkme` (one bit per
+//! Uses an `#[in_span]`-style argument surface (`name`,
+//! `fields(key = expr, ...)`), but gates span creation behind a per-function
+//! bitmask discovered at link time via `linkme` (one bit per
 //! `stylus::instrumentation` slot), so tracing can be toggled per function --
-//! and per instrumentation -- at runtime without recompiling.
+//! and per instrumentation -- at runtime without recompiling. There is no
+//! `tracer` argument: each instrumentation brings its own tracer, so a call site
+//! has nothing to name.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -51,7 +53,6 @@ impl Parse for Field {
 #[derive(Default)]
 struct TraceableArgs {
     name: Option<LitStr>,
-    tracer: Option<LitStr>,
     fields: Option<Vec<Field>>,
 }
 
@@ -66,13 +67,6 @@ impl Parse for TraceableArgs {
                     let lit: LitStr = input.parse()?;
                     if args.name.replace(lit).is_some() {
                         return Err(syn::Error::new(ident.span(), "duplicate `name` argument"));
-                    }
-                }
-                "tracer" => {
-                    input.parse::<Token![=]>()?;
-                    let lit: LitStr = input.parse()?;
-                    if args.tracer.replace(lit).is_some() {
-                        return Err(syn::Error::new(ident.span(), "duplicate `tracer` argument"));
                     }
                 }
                 "fields" => {
@@ -101,19 +95,22 @@ impl Parse for TraceableArgs {
 
 /// Marks a `fn` or `async fn` as a candidate for tracing.
 ///
-/// Every call checks a per-function, link-time-registered flag before doing
-/// any span/context work, so disabled functions cost a single atomic load.
-/// Enable/disable a function by its registry key at runtime via
-/// `stylus::config` (default key: `module_path!() + "::" + fn_name`, or the
-/// `name` argument if given — note this key is not qualified by the
-/// surrounding `impl` type, so two methods with the same name in the same
-/// module share a key unless `name` disambiguates them).
+/// Every call checks a per-function, link-time-registered bitmask before doing
+/// any span/context work, so a function no instrumentation is tracing costs a
+/// single atomic load. Enable it at runtime through a
+/// `stylus::instrumentation::Instrumentation`, which supplies the tracer the
+/// span is created from — the macro itself never names or looks up a tracer.
+///
+/// The registry key used to enable a function defaults to
+/// `module_path!() + "::" + fn_name`, or the `name` argument if given. Note the
+/// key is not qualified by the surrounding `impl` type, so two methods with the
+/// same name in the same module share a key unless `name` disambiguates them.
 ///
 /// ```ignore
 /// #[traceable]
 /// fn process() { }
 ///
-/// #[traceable(name = "kafka.fetch", tracer = "my-service")]
+/// #[traceable(name = "kafka.fetch")]
 /// async fn fetch() { }
 ///
 /// #[traceable(fields("component" = "proxy", request_id = id))]
@@ -121,10 +118,10 @@ impl Parse for TraceableArgs {
 /// ```
 ///
 /// Whether a function is allowed to root a trace or is *child-only* (only ever
-/// creates a span when called from within an already-active span, never as a
-/// root) is not a source annotation — it's decided at runtime via
-/// `stylus::config`, since whether a shared function should root a trace
-/// depends on what's being traced.
+/// creates a span when its instrumentation already has a recording span on the
+/// current call path, never as a root) is not a source annotation — it's decided
+/// at runtime per instrumentation, since whether a shared function should root a
+/// trace depends on what's being traced.
 #[proc_macro_attribute]
 pub fn traceable(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as TraceableArgs);
@@ -152,13 +149,8 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
         None => quote! { ::std::concat!(::std::module_path!(), "::", #fn_ident_str) },
     };
 
-    let tracer_name = match &args.tracer {
-        Some(lit) => quote! { #lit },
-        None => quote! { ::std::env!("CARGO_PKG_NAME") },
-    };
-
-    // The `fields(...)` as `KeyValue` expressions, reused by both the
-    // default-only fast branch and the multi-instrumentation branch.
+    // The `fields(...)` as `KeyValue` expressions, handed to `start_spans` so
+    // every active instrumentation stamps the same attributes on its own span.
     let kvs: Vec<TokenStream2> = match &args.fields {
         None => Vec::new(),
         Some(fields) => fields
@@ -171,43 +163,10 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
             .collect(),
     };
 
-    let span_init = if kvs.is_empty() {
-        quote! { ::opentelemetry::trace::Tracer::start(&__stylus_tracer, #span_name) }
-    } else {
-        quote! {
-            ::opentelemetry::trace::SpanBuilder::from_name(#span_name)
-                .with_attributes([#(#kvs),*])
-                .start(&__stylus_tracer)
-        }
-    };
-
-    // The default-only (`mask == 1`) branch is byte-for-byte what stylus has
-    // always generated: one span from the process-global tracer, nested under
-    // the single ambient context. No instrumentation-slot machinery, so
-    // existing callers pay exactly what they always have.
-    let default_enabled_branch = if is_async {
-        quote! {
-            let __stylus_tracer = ::opentelemetry::global::tracer(#tracer_name);
-            let __stylus_span = #span_init;
-            let __stylus_cx = <::opentelemetry::Context as ::opentelemetry::trace::TraceContextExt>::current_with_span(__stylus_span);
-            ::opentelemetry::trace::FutureExt::with_context(async #block, __stylus_cx).await
-        }
-    } else {
-        quote! {
-            let __stylus_tracer = ::opentelemetry::global::tracer(#tracer_name);
-            let __stylus_span = #span_init;
-            let __stylus_cx = <::opentelemetry::Context as ::opentelemetry::trace::TraceContextExt>::current_with_span(__stylus_span);
-            let __stylus_guard = __stylus_cx.attach();
-            let __stylus_ret = #block;
-            ::std::mem::drop(__stylus_guard);
-            __stylus_ret
-        }
-    };
-
-    // The multi-instrumentation branch: `start_spans` builds one child span per
-    // active slot (with that slot's own tracer/parent) and hands back the single
-    // context to attach, or `None` if every active slot was child-only-suppressed.
-    let multi_wrapped = if is_async {
+    // `start_spans` builds one child span per active slot (with that slot's own
+    // tracer and parent) and hands back the single context to attach, or `None`
+    // if every active slot was child-only-suppressed.
+    let traced = if is_async {
         quote! {
             ::opentelemetry::trace::FutureExt::with_context(async #block, __stylus_cx).await
         }
@@ -221,9 +180,9 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
     };
 
     // Fast-path dispatch on the enabled bitmask:
-    //   0 -> nobody's tracing; run the body raw (a single atomic load).
-    //   1 -> only the default instrumentation; today's exact code path.
-    //   _ -> at least one named instrumentation is active; go wide.
+    //   0 -> no instrumentation is tracing this function; run the body raw,
+    //        having paid a single atomic load.
+    //   _ -> at least one is; build a span per active slot.
     quote! {
         #(#attrs)*
         #vis #sig {
@@ -235,27 +194,15 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
                 __STYLUS_SITE.enabled_mask.load(::std::sync::atomic::Ordering::Relaxed);
             if __stylus_mask == 0u64 {
                 #block
-            } else if __stylus_mask == 1u64 {
-                if __STYLUS_SITE.child_only_mask.load(::std::sync::atomic::Ordering::Relaxed) & 1u64 != 0
-                    && !<::opentelemetry::Context as ::opentelemetry::trace::TraceContextExt>::span(
-                        &::opentelemetry::Context::current(),
-                    )
-                    .is_recording()
-                {
-                    #block
-                } else {
-                    #default_enabled_branch
-                }
             } else {
                 match ::stylus::instrumentation::start_spans(
                     __stylus_mask,
                     __STYLUS_SITE.child_only_mask.load(::std::sync::atomic::Ordering::Relaxed),
                     #span_name,
-                    #tracer_name,
                     ::std::vec![#(#kvs),*],
                 ) {
                     ::std::option::Option::None => #block,
-                    ::std::option::Option::Some(__stylus_cx) => { #multi_wrapped }
+                    ::std::option::Option::Some(__stylus_cx) => { #traced }
                 }
             }
         }

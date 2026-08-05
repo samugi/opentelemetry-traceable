@@ -3,9 +3,10 @@
 //!
 //! This is what lets a consumer *without* running Rust -- an LLM with source
 //! access, a script, an operator -- independently pick a subset and build the
-//! exact encoded string [`crate::config::set_enabled_encoded`] expects: read
-//! this catalog, pick functions by name or id, and either call
-//! [`crate::config::encode`], or hand the chosen ids to `stylus-cli encode`.
+//! exact encoded string
+//! [`Instrumentation::set_enabled_encoded`](crate::instrumentation::Instrumentation::set_enabled_encoded)
+//! expects: read this catalog, pick functions by name or id, and either call
+//! [`crate::codec::encode`], or hand the chosen ids to `stylus-cli encode`.
 //!
 //! An `id` is the function's index in [`crate::registry::REGISTRY`] -- dense,
 //! incremental, and stable for a given build. Because it's a positional index,
@@ -29,8 +30,8 @@ use crate::registry::REGISTRY;
 /// (`stylus-cli graph`), which augments this dump with `callers`/`callees`.
 #[derive(Debug, Serialize)]
 pub struct FunctionEntry {
-    /// The registry key -- what `stylus::config`'s exact-name functions
-    /// match against.
+    /// The registry key -- `module_path!() + "::" + fn_name`, or the
+    /// `#[traceable]` macro's `name` argument.
     pub name: &'static str,
     /// The function's index in [`crate::registry::REGISTRY`] -- the value
     /// [`crate::codec::encode`] delta-compresses to build an enabled set.
@@ -62,4 +63,11 @@ pub fn catalog() -> Catalog {
 /// [`catalog`], serialized as pretty-printed JSON.
 pub fn catalog_json() -> String {
     serde_json::to_string_pretty(&catalog()).expect("Catalog serialization is infallible")
+}
+
+/// Every registry key known so far -- one per `#[traceable]` function linked
+/// into the current binary. Just the names; see [`catalog`] for the ids that go
+/// with them.
+pub fn all_names() -> impl Iterator<Item = &'static str> {
+    REGISTRY.iter().map(|site| site.name)
 }
