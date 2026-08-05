@@ -249,9 +249,46 @@ got *faster*, because `start_spans` shed the slot-0 branch and the
 skip the envelope. Trading ~3% on one path for the deletion of an entire special
 case — and for a uniform mental model — was judged worth it.
 
+## Stable trace-site ids
+
+Ids were originally a site's position in the `linkme`-collected `REGISTRY`. That
+turned out to be unusable: `linkme` guarantees no ordering, and in practice the
+order shifted on almost any rebuild — editing a file containing no `#[traceable]`
+function at all was enough, and debug and release never agreed with each other.
+Since a stale encoded value still decodes (out-of-range ids are skipped,
+in-range ones resolve to whatever now sits at that index), every such rebuild
+silently retargeted tracing with no error anywhere.
+
+An id is now an index into the **sorted set of registry keys**
+(`registry::names_by_id`). That depends on nothing but the keys themselves, so it
+is invariant under rebuilds, edits anywhere in the source, moving functions
+within a file, and the build profile.
+
+Two alternatives were rejected:
+
+- **Hashing each key into a build-independent `u64`.** Stable, but it scatters
+  ids across the whole range, and the codec's compactness comes from delta-encoding
+  a *dense* index — every encoded string would balloon.
+- **Sorting by `(name, file, line)`.** Was implemented briefly, using `file!()`/
+  `line!()` from the macro to break ties between sites sharing a key. Rejected: it
+  reintroduces a source-location dependency, so two same-key sites in one file
+  swap ids when reordered. Sorting keys alone removes the tie-break entirely.
+
+Consequences worth noting:
+
+- Sites sharing a registry key (two methods with the same name in one module,
+  absent a `name` override) now share one id and toggle together. Previously they
+  had distinct ids that nothing could tell apart. `apply_encoded` walks a grouped
+  view so one id flips every site carrying that key.
+- Sorting by key clusters a module's functions onto consecutive ids, so
+  module-shaped subsets encode smaller than before.
+- Adding or removing a key still renumbers the ids after it. That's inherent to a
+  dense index and is the only case that requires re-encoding.
+
 ## Files
 
-- `stylus/src/registry.rs` — `TraceSite` masks.
+- `stylus/src/registry.rs` — `TraceSite` masks, and the sorted-key id ordering
+  (`names_by_id` / `name_by_id` / `id_of_name`).
 - `stylus/src/instrumentation.rs` — `Instrumentation`, `InstrumentationBuilder`,
   constants, `ArcSwap` slot table, free-list allocator, shared bit-op helpers,
   `DynTracer`, `MultiInstrumentState`, `start_spans`.

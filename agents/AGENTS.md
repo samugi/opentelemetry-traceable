@@ -23,10 +23,11 @@ The config has **two** encoded id lists:
   by many flows) from orphaning as a stray root span on the flows you didn't ask to trace.
 
 Each is a compact, lossless base64 encoding of a set of trace-site ids — no false positives,
-exactly the listed functions toggle. An `id` is a function's index in the running binary's
-registry, so ids (and any encoded value) are **specific to that build**: always use a catalog
-from the current binary. You compute both sets mechanically from the catalog graph. Nothing here
-requires understanding the code — it's graph traversal plus one membership rule.
+exactly the listed functions toggle. An `id` is a function's index in the sorted set of registry
+keys; ids are stable across rebuilds, but **adding or removing a `#[traceable]` function renumbers
+them**, so use a catalog from the app's own binary and regenerate it if the set of traced functions
+has changed. You compute both sets mechanically from the catalog graph. Nothing here requires
+understanding the code — it's graph traversal plus one membership rule.
 
 Two facts about how `stylus` applies these, because they constrain the sets you compute:
 

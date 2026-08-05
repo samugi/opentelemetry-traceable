@@ -56,7 +56,7 @@ use opentelemetry::{Context, KeyValue};
 use smallvec::SmallVec;
 
 use crate::codec::{self, DecodeError};
-use crate::registry::{REGISTRY, TraceSite};
+use crate::registry::{self, REGISTRY, TraceSite};
 
 /// Number of [`Instrumentation`]s that can be live simultaneously -- one bit per
 /// slot in each site's `u64` masks. Slots are released on `Drop` and reused, so
@@ -92,20 +92,24 @@ fn apply_encoded(
     slot: u8,
     op: BitOp,
 ) -> Result<(), DecodeError> {
-    // Decoded ids are trace-site indices into `REGISTRY`; membership is a
-    // direct positional lookup -- no hashing, no false positives.
+    // Decoded ids index the sorted set of registry keys (see
+    // `registry::names_by_id`), never a raw `REGISTRY` position; membership is a
+    // direct positional lookup -- no hashing, no false positives. Iterating the
+    // grouped view means a key shared by two call sites flips both.
     let wanted: HashSet<u64> = codec::decode(encoded)?.into_iter().collect();
     let b = bit(slot);
-    for (idx, site) in REGISTRY.iter().enumerate() {
-        let hit = wanted.contains(&(idx as u64));
-        match (op, hit) {
-            (BitOp::Replace | BitOp::Add, true) => {
-                field(site).fetch_or(b, Ordering::Relaxed);
+    for (id, sites) in registry::sites_by_id().iter().enumerate() {
+        let hit_wanted = wanted.contains(&(id as u64));
+        for site in sites {
+            match (op, hit_wanted) {
+                ((BitOp::Replace | BitOp::Add), true) => {
+                    field(site).fetch_or(b, Ordering::Relaxed);
+                }
+                (BitOp::Replace, false) | (BitOp::Remove, true) => {
+                    field(site).fetch_and(!b, Ordering::Relaxed);
+                }
+                (BitOp::Add, false) | (BitOp::Remove, false) => {}
             }
-            (BitOp::Replace, false) | (BitOp::Remove, true) => {
-                field(site).fetch_and(!b, Ordering::Relaxed);
-            }
-            (BitOp::Add, false) | (BitOp::Remove, false) => {}
         }
     }
     Ok(())
@@ -137,12 +141,20 @@ pub(crate) fn slot_disable_encoded(encoded: &str, slot: u8) -> Result<(), Decode
     apply_encoded(encoded, |s| &s.enabled_mask, slot, BitOp::Remove)
 }
 
+// Both name listings walk the stable id order, so what they yield is ordered by
+// id (and thus reproducible) rather than by whatever order the linker chose.
+// One key yields one name even when several call sites carry it.
 pub(crate) fn slot_enabled_names(slot: u8) -> impl Iterator<Item = &'static str> {
     let b = bit(slot);
-    REGISTRY
+    registry::names_by_id()
         .iter()
-        .filter(move |site| site.enabled_mask.load(Ordering::Relaxed) & b != 0)
-        .map(|site| site.name)
+        .zip(registry::sites_by_id())
+        .filter(move |(_, sites)| {
+            sites
+                .iter()
+                .any(|s| s.enabled_mask.load(Ordering::Relaxed) & b != 0)
+        })
+        .map(|(name, _)| *name)
 }
 
 pub(crate) fn slot_set_child_only_encoded(encoded: &str, slot: u8) -> Result<(), DecodeError> {
@@ -151,10 +163,15 @@ pub(crate) fn slot_set_child_only_encoded(encoded: &str, slot: u8) -> Result<(),
 
 pub(crate) fn slot_child_only_names(slot: u8) -> impl Iterator<Item = &'static str> {
     let b = bit(slot);
-    REGISTRY
+    registry::names_by_id()
         .iter()
-        .filter(move |site| site.child_only_mask.load(Ordering::Relaxed) & b != 0)
-        .map(|site| site.name)
+        .zip(registry::sites_by_id())
+        .filter(move |(_, sites)| {
+            sites
+                .iter()
+                .any(|s| s.child_only_mask.load(Ordering::Relaxed) & b != 0)
+        })
+        .map(|(name, _)| *name)
 }
 
 // ---------------------------------------------------------------------------

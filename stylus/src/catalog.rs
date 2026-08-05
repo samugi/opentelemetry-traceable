@@ -8,11 +8,10 @@
 //! expects: read this catalog, pick functions by name or id, and either call
 //! [`crate::codec::encode`], or hand the chosen ids to `stylus-cli encode`.
 //!
-//! An `id` is the function's index in [`crate::registry::REGISTRY`] -- dense,
-//! incremental, and stable for a given build. Because it's a positional index,
-//! it's only valid for the exact binary that produced this catalog; if the set
-//! of `#[traceable]` functions changes, ids shift and the catalog must be
-//! regenerated.
+//! An `id` is the function's index in the sorted set of registry keys (see
+//! [`crate::registry::names_by_id`]) -- dense, and stable across rebuilds and
+//! build profiles. Regenerate this catalog when you add or remove a
+//! `#[traceable]` function, which renumbers the ids after it.
 //!
 //! `stylus` has no way to know how a given application wants to expose this
 //! (an admin endpoint, a debug CLI flag, a one-off script) -- it only
@@ -20,7 +19,7 @@
 
 use serde::Serialize;
 
-use crate::registry::REGISTRY;
+use crate::registry;
 
 /// A single `#[traceable]` function's registry key and id, as reported by
 /// [`catalog`].
@@ -33,7 +32,8 @@ pub struct FunctionEntry {
     /// The registry key -- `module_path!() + "::" + fn_name`, or the
     /// `#[traceable]` macro's `name` argument.
     pub name: &'static str,
-    /// The function's index in [`crate::registry::REGISTRY`] -- the value
+    /// The function's stable id -- its index in
+    /// [`crate::registry::names_by_id`], and the value
     /// [`crate::codec::encode`] delta-compresses to build an enabled set.
     pub id: u64,
 }
@@ -49,11 +49,11 @@ pub struct Catalog {
 /// Every `#[traceable]` function linked into the current binary, with its id.
 pub fn catalog() -> Catalog {
     Catalog {
-        functions: REGISTRY
+        functions: registry::names_by_id()
             .iter()
             .enumerate()
-            .map(|(id, site)| FunctionEntry {
-                name: site.name,
+            .map(|(id, name)| FunctionEntry {
+                name,
                 id: id as u64,
             })
             .collect(),
@@ -69,5 +69,5 @@ pub fn catalog_json() -> String {
 /// into the current binary. Just the names; see [`catalog`] for the ids that go
 /// with them.
 pub fn all_names() -> impl Iterator<Item = &'static str> {
-    REGISTRY.iter().map(|site| site.name)
+    registry::names_by_id().iter().copied()
 }

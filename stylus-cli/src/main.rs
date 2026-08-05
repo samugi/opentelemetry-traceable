@@ -3,10 +3,10 @@
 //! required on the caller's side, just this binary.
 //!
 //! This tool only encodes the ids it's given; it has no access to any
-//! particular application's registry. Ids are registry indices, so both the
-//! id list and the encoded string are only meaningful for the exact binary
-//! that produced them. To find out which functions an application knows about
-//! (and their ids), call `stylus::catalog::catalog_json()` *from within that
+//! particular application's registry. Ids index that application's sorted set of
+//! registry keys, so they're stable across its rebuilds but meaningless against
+//! a different application. To find out which functions one knows about (and
+//! their ids), call `stylus::catalog::catalog_json()` *from within that
 //! application* -- see the repo README for the full workflow.
 
 mod graph;

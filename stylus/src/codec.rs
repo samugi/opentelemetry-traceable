@@ -15,13 +15,16 @@
 //! 2. Write each delta as an unsigned LEB128 varint.
 //! 3. base64 the whole byte string (URL-safe, unpadded).
 //!
-//! # Caveat: ids are build-specific
+//! # Caveat: ids move when the set of keys changes
 //!
-//! Because an id is a registry *index*, it is only meaningful for the exact
-//! binary whose registry produced it. An encoded string (and the catalog it
-//! was picked from) must come from the same build; add or remove a
-//! `#[traceable]` function and the ids shift. This is the deliberate trade for
-//! losslessness -- there is no build-independent name hash to fall back on.
+//! An id is an index into the sorted set of registry keys (see
+//! [`crate::registry::names_by_id`]), so it depends on nothing but the keys
+//! themselves -- stable across rebuilds, edits, and profiles. Adding or removing
+//! a `#[traceable]` key renumbers the ids after it, which is the one case that
+//! invalidates an encoded string: re-encode against a fresh catalog.
+//!
+//! Keeping ids dense is what keeps this encoding compact; hashing keys into
+//! build-independent ids would scatter them across `u64` and bloat every string.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 

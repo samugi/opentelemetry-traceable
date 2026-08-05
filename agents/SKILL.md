@@ -23,9 +23,9 @@ a compact, lossless base64 encoding of a set of trace-site ids (no false positiv
 listed functions toggle). You compute both mechanically from the catalog graph: graph traversal
 plus one membership rule, no code comprehension required.
 
-An `id` is a function's index in the running binary's registry, so ids — and any encoded value
-built from them — are **specific to that build**: always use a catalog produced by the current
-binary, and regenerate it if the app's `#[traceable]` functions have changed.
+An `id` is a function's index in the sorted set of registry keys. Ids are stable across rebuilds,
+but **adding or removing a `#[traceable]` function renumbers them** — so use a catalog from the
+app's own binary, and regenerate it if the set of traced functions has changed since.
 
 Two facts about how `stylus` applies these, because they constrain the sets you compute:
 
@@ -62,7 +62,7 @@ Two facts about how `stylus` applies these, because they constrain the sets you 
       `grep -rl '"functions"' . | xargs grep -l '"id"'` finds catalog-shaped JSON).
       **If there's none, stop and ask the user** to generate it — it comes from the app's own
       binary (normally `cargo run --quiet -- catalog > stylus-catalog.json`), not something you
-      can produce. (Also regenerate it if it looks stale — ids must match the current binary.)
+      can produce. (Regenerate it if the app has gained or lost `#[traceable]` functions since.)
    2. Check whether its functions have `callers`/`callees`.
       - They do: use it as-is.
       - They don't (just `{name, id}`): add them yourself (this only needs the source):

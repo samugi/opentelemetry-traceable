@@ -194,18 +194,30 @@ instr.enable_encoded(&encoded)?;        // additive
 instr.disable_encoded(&encoded)?;       // subtractive
 ```
 
-An `id` is a `#[traceable]` function's **index in the registry** (`stylus::registry::REGISTRY`):
-dense, 0-based, and reported by `stylus::catalog`. Because it's a positional index, an id (and
-any encoded string built from it) is **only valid for the exact binary that produced the
-catalog** — if the set of `#[traceable]` functions changes, ids shift and the catalog must be
-regenerated. That's the deliberate trade for losslessness: there's no build-independent name
-hash, but the encoding is exact and compact (deltas of a sorted dense index stay tiny). Sorting
-is done in place, which is why `encode` takes `&mut [u64]`. Decoding is
+An `id` is a `#[traceable]` function's index in the **sorted set of registry keys**
+(`stylus::registry::names_by_id`): dense, 0-based, and reported by `stylus::catalog`. Sorting is
+done in place, which is why `encode` takes `&mut [u64]`. Decoding is
 `stylus::codec::decode(&str) -> Result<Vec<u64>, stylus::codec::DecodeError>`; a corrupt string
 returns `Err(DecodeError)` and leaves state unchanged.
 
 Ids are build-scoped, not instrumentation-scoped: the same encoded string means the same set of
 functions for every instrumentation in that binary.
+
+### When ids change
+
+An id depends on nothing but the set of registry keys, so it survives rebuilds, edits anywhere in
+the source, moving functions around, and differing profiles — debug and release agree. **Adding or
+removing a `#[traceable]` key renumbers the ids after it**, and that's the only thing that
+invalidates an encoded string; regenerate the catalog and re-encode.
+
+Deriving ids from keys rather than from registry position is what makes that hold: `linkme` gives
+no ordering guarantee and its order does shift between builds. Keeping them dense (rather than
+hashing each key into a build-independent `u64`) is what keeps the encoding compact, and sorting by
+key clusters a module's functions onto consecutive ids, so module-shaped subsets encode especially
+small.
+
+Two call sites can share a key — two methods with the same name in the same module, absent a `name`
+override. They share an id and toggle together.
 
 To enable *everything* without enumerating every id from code, call `instr.enable_all()`. For a
 config-file-driven setup, encode every id from the catalog instead. "Disable everything" is still
@@ -233,8 +245,8 @@ reasonably be handed a plain name list:
      ]
    }
    ```
-   Because ids are positional registry indices, this catalog is only valid for the exact binary
-   that produced it — regenerate it whenever the set of `#[traceable]` functions changes.
+   Ids are stable across rebuilds; regenerate this when you add or remove a `#[traceable]`
+   function (see [When ids change](#when-ids-change)).
    This is the *node* list. Call-graph edges aren't known to the running binary; run
    `stylus-cli graph` (below) over your source to augment this with `callers`/`callees` per
    function (plus an `unresolved_calls` worklist) — needed to pick enabled ancestors and

@@ -378,6 +378,39 @@ fn catalog_reports_every_traceable_function_with_a_matching_id() {
     assert!(parsed["functions"].as_array().unwrap().len() >= catalog.functions.len());
 }
 
+#[test]
+fn ids_depend_only_on_the_sorted_set_of_registry_keys() {
+    // An id is an index into the sorted set of registry keys -- never a raw
+    // `REGISTRY` position, and with no dependence on source location. That's
+    // what makes an encoded subset survive a rebuild: nothing about linker
+    // layout, an unrelated edit, moving a function within its file, or the build
+    // profile can perturb it. Only adding/removing a key can.
+    let names = stylus::registry::names_by_id();
+
+    let mut expected: Vec<&str> = stylus::catalog::all_names().collect();
+    expected.sort_unstable();
+    expected.dedup();
+    assert_eq!(
+        names, expected,
+        "ids must follow the sorted, de-duplicated key order"
+    );
+
+    // Ids are dense 0..n and round-trip both ways against the catalog.
+    for (id, name) in names.iter().enumerate() {
+        let id = id as u64;
+        assert_eq!(stylus::registry::name_by_id(id), Some(*name));
+        assert_eq!(stylus::registry::id_of_name(name), Some(id));
+    }
+    assert_eq!(stylus::registry::name_by_id(names.len() as u64), None);
+    assert_eq!(stylus::registry::id_of_name("nope::not::a::key"), None);
+
+    let catalog = stylus::catalog::catalog();
+    assert_eq!(catalog.functions.len(), names.len());
+    for entry in &catalog.functions {
+        assert_eq!(stylus::registry::name_by_id(entry.id), Some(entry.name));
+    }
+}
+
 // --- In-process only: `Context`'s span slot is never read or written ---------
 
 #[test]
