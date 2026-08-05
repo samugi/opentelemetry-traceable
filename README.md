@@ -46,9 +46,7 @@ The fix is *child-only mode*: a function in this mode only creates a span when i
 within an already-active (recording) span — never a root, even when enabled.
 
 ```rust
-stylus::config::set_child_only(["my_crate::shared_helper"]);
-// or from a compact encoded id list, exactly like the enabled set:
-stylus::config::set_child_only_encoded(&encoded)?;
+stylus::config::set_child_only_encoded(&encoded)?; // same compact id list as the enabled set
 ```
 
 Crucially this is **not** a source annotation — it's set at runtime, because whether a shared
@@ -66,22 +64,26 @@ and the agent workflow below automate.
 
 ## Configuring what's enabled
 
+The default instrumentation is configured exclusively through compact encoded id lists (see
+[Compact subset encoding](#compact-subset-encoding) below for how `encoded` is produced) — there's
+no name-based way to enable/disable it. A name list doesn't scale as a wire format: 100 names out
+of a 100,000-function registry is 4-6 KB of configuration just to select 0.1% of it, so encoded
+ids are the only way in.
+
 ```rust
-stylus::config::enable(["my_crate::process", "kafka.fetch"]);
-stylus::config::disable(["my_crate::process"]);
-stylus::config::set_enabled(["kafka.fetch"]); // replace the whole active set
+stylus::config::enable_encoded(&encoded)?;
+stylus::config::disable_encoded(&encoded)?;
+stylus::config::set_enabled_encoded(&encoded)?; // replace the whole active set
 stylus::config::enable_all();
 stylus::config::disable_all();
-stylus::config::is_enabled("kafka.fetch"); // -> bool
 stylus::config::all_names(); // -> every registered key, for introspection
+stylus::config::enabled_names(); // -> those currently enabled
 
-stylus::config::set_child_only(["my_crate::shared_helper"]); // replace the child-only set
+stylus::config::set_child_only_encoded(&encoded)?; // replace the child-only set
 stylus::config::child_only_names(); // -> those currently in child-only mode
 ```
 
-This works fine for a handful of functions. It doesn't scale as a wire format: 100 names out of
-a 100,000-function registry is 4-6 KB of configuration just to select 0.1% of it. That's what
-the rest of this document is for.
+Named instrumentations (next section) are configured the same way, through encoded id lists.
 
 ## Multiple parallel instrumentations
 
@@ -94,9 +96,9 @@ let checkout = stylus::instrumentation::Instrumentation::builder()
     .name("checkout-debug")
     .tracer(provider.tracer("checkout-debug")) // any opentelemetry Tracer
     .build()?;
-checkout.enable(["my_crate::checkout", "my_crate::db::insert"]);
-// ... same enable/disable/set_child_only/*_encoded API as `stylus::config`, scoped to this handle.
-// Dropping `checkout` stops new spans for it and frees the slot.
+checkout.enable_encoded(&encoded)?;
+// ... same enable/disable/set_child_only_encoded/enable_all/disable_all API as `stylus::config`,
+// scoped to this handle. Dropping `checkout` stops new spans for it and frees the slot.
 ```
 
 The default and each named instrumentation build fully independent traces from the same physical

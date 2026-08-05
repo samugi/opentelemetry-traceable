@@ -16,7 +16,7 @@
 //!     .tracer(provider.tracer("checkout-debug"))
 //!     .build()
 //!     .expect("a free instrumentation slot");
-//! checkout.enable(["my_crate::checkout", "my_crate::db::insert"]);
+//! checkout.enable_encoded(&encoded)?;
 //! // ... dropping `checkout` stops new spans for it and frees the slot.
 //! ```
 //!
@@ -82,28 +82,6 @@ enum BitOp {
     Remove,
 }
 
-fn apply_names<'a>(
-    names: impl IntoIterator<Item = &'a str>,
-    field: impl Fn(&TraceSite) -> &AtomicU64,
-    slot: u8,
-    op: BitOp,
-) {
-    let b = bit(slot);
-    let wanted: HashSet<&str> = names.into_iter().collect();
-    for site in REGISTRY.iter() {
-        let hit = wanted.contains(site.name);
-        match (op, hit) {
-            (BitOp::Replace | BitOp::Add, true) => {
-                field(site).fetch_or(b, Ordering::Relaxed);
-            }
-            (BitOp::Replace, false) | (BitOp::Remove, true) => {
-                field(site).fetch_and(!b, Ordering::Relaxed);
-            }
-            (BitOp::Add, false) | (BitOp::Remove, false) => {}
-        }
-    }
-}
-
 fn apply_encoded(
     encoded: &str,
     field: impl Fn(&TraceSite) -> &AtomicU64,
@@ -127,18 +105,6 @@ fn apply_encoded(
         }
     }
     Ok(())
-}
-
-pub(crate) fn slot_set_enabled<'a>(names: impl IntoIterator<Item = &'a str>, slot: u8) {
-    apply_names(names, |s| &s.enabled_mask, slot, BitOp::Replace);
-}
-
-pub(crate) fn slot_enable<'a>(names: impl IntoIterator<Item = &'a str>, slot: u8) {
-    apply_names(names, |s| &s.enabled_mask, slot, BitOp::Add);
-}
-
-pub(crate) fn slot_disable<'a>(names: impl IntoIterator<Item = &'a str>, slot: u8) {
-    apply_names(names, |s| &s.enabled_mask, slot, BitOp::Remove);
 }
 
 pub(crate) fn slot_enable_all(slot: u8) {
@@ -167,32 +133,12 @@ pub(crate) fn slot_disable_encoded(encoded: &str, slot: u8) -> Result<(), Decode
     apply_encoded(encoded, |s| &s.enabled_mask, slot, BitOp::Remove)
 }
 
-pub(crate) fn slot_is_enabled(name: &str, slot: u8) -> bool {
-    let b = bit(slot);
-    REGISTRY
-        .iter()
-        .find(|site| site.name == name)
-        .is_some_and(|site| site.enabled_mask.load(Ordering::Relaxed) & b != 0)
-}
-
 pub(crate) fn slot_enabled_names(slot: u8) -> impl Iterator<Item = &'static str> {
     let b = bit(slot);
     REGISTRY
         .iter()
         .filter(move |site| site.enabled_mask.load(Ordering::Relaxed) & b != 0)
         .map(|site| site.name)
-}
-
-pub(crate) fn slot_set_child_only<'a>(names: impl IntoIterator<Item = &'a str>, slot: u8) {
-    apply_names(names, |s| &s.child_only_mask, slot, BitOp::Replace);
-}
-
-pub(crate) fn slot_enable_child_only<'a>(names: impl IntoIterator<Item = &'a str>, slot: u8) {
-    apply_names(names, |s| &s.child_only_mask, slot, BitOp::Add);
-}
-
-pub(crate) fn slot_disable_child_only<'a>(names: impl IntoIterator<Item = &'a str>, slot: u8) {
-    apply_names(names, |s| &s.child_only_mask, slot, BitOp::Remove);
 }
 
 pub(crate) fn slot_set_child_only_encoded(encoded: &str, slot: u8) -> Result<(), DecodeError> {
@@ -460,21 +406,6 @@ impl Instrumentation {
         InstrumentationBuilder::default()
     }
 
-    /// Replace this instrumentation's enabled set with exactly `names`.
-    pub fn set_enabled<'a>(&self, names: impl IntoIterator<Item = &'a str>) {
-        slot_set_enabled(names, self.slot);
-    }
-
-    /// Enable `names` for this instrumentation (additive).
-    pub fn enable<'a>(&self, names: impl IntoIterator<Item = &'a str>) {
-        slot_enable(names, self.slot);
-    }
-
-    /// Disable `names` for this instrumentation, leaving the rest untouched.
-    pub fn disable<'a>(&self, names: impl IntoIterator<Item = &'a str>) {
-        slot_disable(names, self.slot);
-    }
-
     /// Enable every known `#[traceable]` function for this instrumentation.
     pub fn enable_all(&self) {
         slot_enable_all(self.slot);
@@ -501,31 +432,10 @@ impl Instrumentation {
         slot_disable_encoded(encoded, self.slot)
     }
 
-    /// Replace this instrumentation's child-only set with exactly `names` (see
-    /// [`crate::config::set_child_only`]).
-    pub fn set_child_only<'a>(&self, names: impl IntoIterator<Item = &'a str>) {
-        slot_set_child_only(names, self.slot);
-    }
-
-    /// Add `names` to this instrumentation's child-only set.
-    pub fn enable_child_only<'a>(&self, names: impl IntoIterator<Item = &'a str>) {
-        slot_enable_child_only(names, self.slot);
-    }
-
-    /// Remove `names` from this instrumentation's child-only set.
-    pub fn disable_child_only<'a>(&self, names: impl IntoIterator<Item = &'a str>) {
-        slot_disable_child_only(names, self.slot);
-    }
-
-    /// Replace the child-only set from a compact encoded id list.
+    /// Replace the child-only set from a compact encoded id list (see
+    /// [`crate::config::set_child_only_encoded`] for the semantics).
     pub fn set_child_only_encoded(&self, encoded: &str) -> Result<(), DecodeError> {
         slot_set_child_only_encoded(encoded, self.slot)
-    }
-
-    /// Whether `name` is enabled for this instrumentation.
-    #[must_use]
-    pub fn is_enabled(&self, name: &str) -> bool {
-        slot_is_enabled(name, self.slot)
     }
 
     /// Registry keys currently enabled for this instrumentation.

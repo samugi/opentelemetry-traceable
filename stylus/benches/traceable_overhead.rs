@@ -110,7 +110,7 @@ fn bench_traceable_overhead(c: &mut Criterion) {
     opentelemetry::global::set_tracer_provider(provider);
 
     stylus::config::enable_all();
-    stylus::config::set_child_only([]);
+    stylus::config::set_child_only_encoded(&stylus::config::encode(&mut [])).unwrap();
     group.bench_function("traceable_enab", |b| {
         b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
     });
