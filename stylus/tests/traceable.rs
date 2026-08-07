@@ -395,19 +395,14 @@ fn ids_depend_only_on_the_sorted_set_of_registry_keys() {
         "ids must follow the sorted, de-duplicated key order"
     );
 
-    // Ids are dense 0..n and round-trip both ways against the catalog.
-    for (id, name) in names.iter().enumerate() {
-        let id = id as u64;
-        assert_eq!(stylus::registry::name_by_id(id), Some(*name));
-        assert_eq!(stylus::registry::id_of_name(name), Some(id));
-    }
-    assert_eq!(stylus::registry::name_by_id(names.len() as u64), None);
-    assert_eq!(stylus::registry::id_of_name("nope::not::a::key"), None);
-
+    // Ids are dense 0..n: the catalog is exactly the sorted key order, position
+    // for position, with each entry's id equal to its index.
     let catalog = stylus::catalog::catalog();
     assert_eq!(catalog.functions.len(), names.len());
-    for entry in &catalog.functions {
-        assert_eq!(stylus::registry::name_by_id(entry.id), Some(entry.name));
+    for (id, name) in names.iter().enumerate() {
+        let entry = &catalog.functions[id];
+        assert_eq!(entry.id, id as u64);
+        assert_eq!(entry.name, *name);
     }
 }
 

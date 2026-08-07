@@ -3,129 +3,115 @@ name: configure-tracing
 description: Turn stylus tracing on or off for a subset of this app's functions, described in plain English (e.g. "trace the database", "trace the payment gateway", "turn off tracing"). Manually invoked -- run explicitly when asked to change what's traced.
 ---
 
-> **Written for:** `stylus` @ `main` (this repo has no tagged releases yet — `main` is the only
-> version, and it can gain new flags at any time). This skill assumes `stylus-cli` has both an
-> `encode` subcommand (`--ids`) and a `graph` subcommand (`--catalog`, `--src`). If
-> `stylus-cli --help` doesn't list `graph`, or `encode` doesn't take `--ids`, this file or your
-> installed `stylus-cli` is stale — re-fetch it from https://github.com/samugi/stylus
-> (`agents/SKILL.md`) and reinstall `stylus-cli` (step 1).
+This application uses `stylus` for dynamic, per-function tracing: any `#[traceable]` function can
+be turned on or off at runtime by editing a local config file. `args` is the request in plain
+English (e.g. "trace the database"). Follow this procedure step by step, in order.
 
-This application uses `stylus` for dynamic, per-function tracing: any `#[traceable]` function
-can be turned on/off at runtime by editing a local config file. `args` is the request in plain
-English (e.g. "trace the database"). Follow this procedure step by step, in order. Do not write
-a new script or improvise a different mechanism — everything needed is `stylus-cli`, a committed
-call-graph catalog, and editing one config file.
+Each instrumentation in the config carries **two** encoded id lists: `enabled` (which functions
+it traces at all) and `child_only` (which of those span only when that instrumentation already
+has a recording span on the call path, never as a root — this keeps a shared helper from
+emitting stray root spans on flows you weren't asked to trace). Each is a lossless encoding of a
+set of function **ids** — exactly the listed functions toggle, no false positives.
 
-The config holds **two** encoded id lists: `enabled` (which functions trace at all) and
-`child_only` (which enabled functions only span when they already have an active parent, never
-as a root — this keeps a shared helper from orphaning on flows you didn't ask to trace). Each is
-a compact, lossless base64 encoding of a set of trace-site ids (no false positives — exactly the
-listed functions toggle). You compute both mechanically from the catalog graph: graph traversal
-plus one membership rule, no code comprehension required.
+An id is a function's index in the sorted set of registry keys. Ids are stable across rebuilds,
+but adding or removing a `#[traceable]` function renumbers them, so always take ids from a
+catalog produced by the current binary (step 1).
 
-An `id` is a function's index in the sorted set of registry keys. Ids are stable across rebuilds,
-but **adding or removing a `#[traceable]` function renumbers them** — so use a catalog from the
-app's own binary, and regenerate it if the set of traced functions has changed since.
+Two properties of `stylus` constrain the sets you compute:
 
-Two facts about how `stylus` applies these, because they constrain the sets you compute:
-
-- The pair configures one `stylus` **instrumentation** (there is no global or default one —
-  nothing traces unless the app created an instrumentation and fed it these values), and "already
-  have an active parent" always means *a span from that same instrumentation*. If this app's config
-  defines **more than one** instrumentation, each with its own `enabled`/`child_only` pair, stop and
-  ask the user which to change.
-- Only an enabled, **non**-child-only `#[traceable]` function can start a trace. `stylus` does not
-  join an incoming `traceparent`, and a span created outside `stylus` (a framework's server span, a
+- Both lists belong to **one instrumentation**. There is no global or default one, and "already
+  has a recording span" always means *a span from that same instrumentation*. If the config
+  defines more than one and the user didn't say which, stop and ask.
+- Only an enabled, **non**-child-only function can start a trace. `stylus` does not join an
+  incoming `traceparent`, and a span created outside `stylus` (a framework's server span, a
   hand-rolled `tracer.start()`) is never a parent — so never count on an outer span to root the
   trace. If everything in your selection ends up child-only, nothing spans at all.
 
-1. **Make sure `stylus-cli` is current.** Run `stylus-cli --help` and confirm it lists both
-   `encode` and `graph`; then `stylus-cli encode --help` and confirm it takes `--ids`.
-   - All present: continue.
-   - `graph` missing, `--ids` missing, or the command isn't found: (re)install it:
-     ```
-     cargo install --git ssh://git@github.com/samugi/stylus.git stylus-cli --force
-     ```
-   Checking first instead of always reinstalling is deliberate: reinstalling recompiles every
-   time (slow, usually unnecessary). The check protects you from a stale binary (no version
-   tags, so "already installed" doesn't mean "has what you need").
+**Turning everything off needs none of the analysis below:** set both fields to `""` (step 6).
+To trace everything, get the catalog (step 1) and encode every id in it as `enabled`, with
+`child_only` set to `""`.
 
-   **Shortcut for "enable/disable everything":** to disable everything, set *both* `enabled` and
-   `child_only` to `""` (step 6) — no catalog needed. To trace everything, there's no shortcut:
-   get the catalog (step 2), set `enabled` to `stylus-cli encode --ids <every id in the catalog>`
-   and `child_only` to `""`. Otherwise continue.
+1. **Get the catalog** — the `{name, id}` list of every `#[traceable]` function in the binary,
+   which is both the authoritative set of what can be traced and the only source of ids. Only
+   the app's own binary can produce it (the registry is linked into *it*), so use whatever
+   command this app exposes over `stylus::catalog::catalog_json()`; for a Rust binary, typically:
+   ```
+   cargo run --quiet -- catalog > /tmp/stylus-catalog.json
+   ```
+   If there's no such command, **ask the user** how this app exposes its catalog. Don't
+   substitute a list grepped out of the source — guessed ids silently trace the wrong functions.
 
-2. **Get the call-graph catalog.** You need a JSON catalog of every `#[traceable]` function
-   *with its call-graph edges* (`callers`/`callees` per function) — that's what you traverse.
-   1. Find the committed node dump: a `{name, id}` list, commonly `stylus-catalog.json` /
-      `catalog.json` at the repo root or `docs/` (if the name isn't obvious,
-      `grep -rl '"functions"' . | xargs grep -l '"id"'` finds catalog-shaped JSON).
-      **If there's none, stop and ask the user** to generate it — it comes from the app's own
-      binary (normally `cargo run --quiet -- catalog > stylus-catalog.json`), not something you
-      can produce. (Regenerate it if the app has gained or lost `#[traceable]` functions since.)
-   2. Check whether its functions have `callers`/`callees`.
-      - They do: use it as-is.
-      - They don't (just `{name, id}`): add them yourself (this only needs the source):
-        ```
-        stylus-cli graph --catalog <node-dump>.json --src ./src > /tmp/stylus-graph.json
-        ```
-        and use `/tmp/stylus-graph.json` from here on.
+2. **Work out the call graph around the request.** The catalog is nodes only; edges come from
+   reading the source, and they decide who can root a trace and who must be child-only. You only
+   need the part of the graph the request touches.
 
-   The catalog also has an `unresolved_calls` list (calls static analysis couldn't resolve);
-   you only touch it in step 4.
+   Map names to definitions first: a registry key is `module_path!() + "::" + fn_name`, or the
+   string in `#[traceable(name = "...")]`. A key is *not* qualified by a surrounding `impl` type,
+   so two same-named methods in one module share one key and one id and toggle together.
 
-3. **Build the enabled set `E`** (work in function ids):
-   - **Module/concern** ("trace the database"): `E` = every function whose name contains the
-     module (e.g. `::db::`). Done.
+   Then read each function in play and note which **other catalog functions** it calls
+   (`callees`; invert for `callers`):
+   - **Direct calls** — the common case; match the callee against a catalog name.
+   - **Trait objects, `dyn` dispatch, function pointers, callbacks** — read enough source to find
+     the implementations that can actually run on this path. If still ambiguous, include every
+     plausible catalog target: an extra enabled function costs one extra span, a missed edge can
+     silently break the hierarchy.
+   - **Macro-generated calls** — resolve by reading the macro, or treat as ambiguous per above.
+   - **Calls across a task or thread boundary** (`tokio::spawn`, `std::thread::spawn`, work sent
+     over a channel) — **not** a parent/child edge. `stylus` propagates through the ambient
+     `opentelemetry::Context`, which a spawned task doesn't inherit, so a function first reached
+     that way has no parent. Leave it out of `callers` and step 4 keeps it root-capable; mark it
+     child-only and it goes silent instead.
+   - **Recursion and cycles** — record the edges; step 4's cycle guard handles them.
+
+3. **Build the enabled set `E`** (in catalog ids):
+   - **Module or concern** ("trace the database"): every function whose name is in that module
+     (e.g. contains `::db::`).
    - **Flow** ("trace checkout end-to-end"): start at the entry function and walk `callees`
      transitively — add each callee, and its callees, until nothing new appears.
-   - **Subject you want fully rooted** (e.g. complete traces ending in db calls): also walk
-     `callers` upward from the concern functions — add each caller, and its callers, until
-     nothing new appears. This pulls in the entry points so traces are rooted at real flows
-     rather than dangling. (Including this for a plain "trace the database" never hurts.)
+   - **A concern you want rooted at real flows** (usually what "trace the database" actually
+     wants): also walk `callers` upward from the concern functions, transitively. This pulls in
+     the entry points so traces start where the work starts instead of dangling. Including it
+     never hurts.
 
-4. **Fill gaps near your selection (only if needed).** Scan `unresolved_calls` for entries whose
-   `in_fn` (or `candidates`) are in `E`. For *those only*, open the `site` (`file:line`), read
-   the few surrounding lines, resolve the real target, and add it to `E` if step-3 logic says it
-   belongs (a callee on a traced flow, or a caller you're walking up to). Ignore unresolved
-   calls that don't touch your selection. If `unresolved_calls` is empty, skip this step.
-
-5. **Compute the child-only set `CO`** — purely from `E` and the graph:
+4. **Compute the child-only set `CO`** — purely from `E` and the edges:
 
    > **`CO` = every function in `E` that has at least one of its `callers` also in `E`.**
    > (A function is a *root* if none of its callers are in `E`; every other enabled function is
    > child-only.)
 
    That's the whole rule. Tracing a flow: the entry roots, everything downstream is child-only,
-   so a shared helper stays silent on the *other* flows that also call it. Tracing a subject
-   with ancestors walked in: the entry points root, subject functions nest under them, and a
-   subject function with no caller in `E` roots (so it still shows, never vanishes).
+   so a shared helper stays silent on the *other* flows that call it. Tracing a concern with
+   ancestors walked in: the entry points root, concern functions nest under them, and a concern
+   function with no caller in `E` roots on its own, so it still shows rather than vanishing.
 
    **Cycle guard:** if two functions in `E` call each other, the rule can mark both child-only,
    leaving that group rootless (nothing spans). After computing `CO`, ensure every connected
    group in `E` has ≥1 root; if a pure cycle doesn't, drop the requested entry point (or any one
    cycle node) from `CO`.
 
-6. **Update the config, then verify.** Generate both encoded values:
+5. **Encode both sets** with the app's own encode command — the same binary the catalog came
+   from, since ids index its registry. Order of ids doesn't matter.
    ```
-   stylus-cli encode --ids <every id in E>     # -> enabled
-   stylus-cli encode --ids <every id in CO>    # -> child_only
+   cargo run --quiet -- encode --ids <every id in E>     # -> enabled
+   cargo run --quiet -- encode --ids <every id in CO>    # -> child_only
    ```
-   Find the local YAML/JSON config — commonly `config.yaml`/`config.json` at the repo root. The
-   two fields belong to **one instrumentation**: expect a list of them (e.g.
-   `instrumentations:`), each entry with its own `enabled` and `child_only`. Target the entry the
-   user named; if there's more than one and they didn't say which, **ask**. Don't touch other
-   entries, their identity fields (`name`/`service_name`/`otlp_endpoint`), or anything outside
-   the list. **If it isn't obviously the right file/fields, ask the user.** Set both (for a
-   disable request, both `""`). This replaces what's there; to _add_ to what's on, include the
-   previously-enabled ids in `E` too.
+   If the app exposes no encode command, it can be added in two lines over
+   `stylus::codec::encode`; ask the user rather than improvising an encoder.
+
+6. **Update the config, then verify.** Find the local config — commonly `config.yaml` /
+   `config.json` at the repo root. The two fields belong to **one instrumentation**: expect a
+   list of them (e.g. `instrumentations:`), each with its own `enabled` and `child_only`. Target
+   the entry the user named; if there's more than one and they didn't say which, **ask**. Don't
+   touch other entries, their identity fields (`name`/`service_name`/`otlp_endpoint`), or
+   anything outside the list. If it isn't obviously the right file and fields, ask rather than
+   guess. Set both (for a disable request, both `""`). This *replaces* what's there; to add to
+   what's on, include the previously-enabled ids in `E` too.
 
    **Then re-read both fields and compare them character-for-character against what `encode`
-   printed.** Don't report success until they match exactly. A value off by even one character
-   is invalid and silently leaves tracing unchanged (a real failure mode: one dropped character
-   makes the encoded value fail to decode, and the app keeps its old state with no visible
-   effect).
+   printed.** Don't report success until they match exactly. A value off by one character fails
+   to decode, and the app keeps its old state with no visible sign anything went wrong.
 
-7. **Report tersely.** Just confirm tracing was turned on/off for the requested domain, or that
-   it failed and why. Nothing else — no function list, no mechanism explanation, no unsolicited
-   follow-up.
+7. **Report tersely.** Just confirm tracing was turned on or off for the requested domain, or
+   that it failed and why. Nothing else — no function list, no mechanism explanation, no
+   unsolicited follow-up.

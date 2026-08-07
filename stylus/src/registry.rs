@@ -79,22 +79,6 @@ pub fn names_by_id() -> &'static [&'static str] {
     &groups().0
 }
 
-/// The registry key with the given id, or `None` if the id is out of range for
-/// this binary.
-#[must_use]
-pub fn name_by_id(id: u64) -> Option<&'static str> {
-    usize::try_from(id)
-        .ok()
-        .and_then(|id| names_by_id().get(id))
-        .copied()
-}
-
-/// The id of a registry key, or `None` if this binary has no such key.
-#[must_use]
-pub fn id_of_name(name: &str) -> Option<u64> {
-    names_by_id().binary_search(&name).ok().map(|id| id as u64)
-}
-
 /// Every trace site paired with its id, grouped so that sites sharing a key
 /// share an id and are always toggled together.
 ///

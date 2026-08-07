@@ -102,7 +102,7 @@ fn apply_encoded(
         let hit_wanted = wanted.contains(&(id as u64));
         for site in sites {
             match (op, hit_wanted) {
-                ((BitOp::Replace | BitOp::Add), true) => {
+                (BitOp::Replace | BitOp::Add, true) => {
                     field(site).fetch_or(b, Ordering::Relaxed);
                 }
                 (BitOp::Replace, false) | (BitOp::Remove, true) => {

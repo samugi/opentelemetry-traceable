@@ -176,8 +176,8 @@ zero false negatives on the path you enabled, still the same near-zero cost when
 
 Deciding which functions to put in child-only mode for a given request is mechanical given a
 call graph: a function should be child-only exactly when one of its own callers is also being
-traced (so it always has a parent), and root-capable otherwise. That's what `stylus-cli graph`
-and the agent workflow below automate.
+traced (so it always has a parent), and root-capable otherwise. That's the rule the agent
+workflow below applies.
 
 ## Compact subset encoding
 
@@ -247,18 +247,21 @@ reasonably be handed a plain name list:
    ```
    Ids are stable across rebuilds; regenerate this when you add or remove a `#[traceable]`
    function (see [When ids change](#when-ids-change)).
-   This is the *node* list. Call-graph edges aren't known to the running binary; run
-   `stylus-cli graph` (below) over your source to augment this with `callers`/`callees` per
-   function (plus an `unresolved_calls` worklist) — needed to pick enabled ancestors and
-   child-only functions that keep the trace hierarchy intact.
+
+   This is the *node* list. Call-graph edges aren't known to the running binary — the consumer
+   derives them from your source, and they're what decide which functions can root a trace and
+   which should be child-only so the hierarchy stays intact.
 2. **Hand that JSON to the consumer** (an LLM with access to your source, a script, an
    operator) along with the task: "pick whichever of these functions should be traced."
-3. **Turn the picks into an encoded id list.** Either in Rust:
+3. **Turn the picks into an encoded id list:**
    ```rust
    let mut ids = chosen_ids;
    let encoded = stylus::codec::encode(&mut ids);
    ```
-   or without writing any Rust at all, via the CLI (see below).
+   Expose that the same way you exposed the catalog, so the consumer can encode its own picks
+   without writing Rust — the ids index this binary's registry, so nothing outside it can do the
+   encoding on its behalf. (`stylus-demo` wires both up as `catalog` and `encode --ids`
+   subcommands.)
 4. **Apply it** to the instrumentation that should trace that subset:
    `instr.set_enabled_encoded(&encoded)?`.
 
@@ -274,64 +277,21 @@ Simple enough to reimplement in a short script, given a catalog dump's list of c
    continuation flag set on all but the last byte).
 4. **Wire format**: concatenate the varint bytes, then base64 (URL-safe, unpadded).
 
-## `stylus-cli`
-
-A standalone binary for turning an id list into an encoded id list without writing any Rust:
-
-```
-stylus-cli encode --ids 0 3 7   # encode these ids
-stylus-cli encode               # or read ids from stdin (whitespace/newline separated integers)
-```
-
-It accepts **only ids**: the standalone CLI has no access to any app's registry, and since ids
-are registry indices they can't be derived from names without it. Prints the base64 encoded id
-list to stdout. To get the list of functions your application actually knows about (and their
-ids) for a human or LLM to pick from, call `stylus::catalog::catalog_json()` from within that
-application, as described above.
-
-It also builds the call graph, by statically parsing your source (no compile, no run):
-
-```
-stylus-cli graph --catalog catalog.json --src ./src
-```
-
-This takes the node dump (from `catalog_json()`) and prints it back with `callers`/`callees`
-per function, resolving direct calls between `#[traceable]` functions by trailing-path match.
-Calls it can't resolve statically — dynamic dispatch, function pointers, macro-generated
-calls — are listed under `unresolved_calls` (a `file:line` worklist) rather than silently
-dropped, so a source-aware agent can fill in just the ones relevant to its request. It's exact
-for direct calls (see the `unresolved_calls` note for the blind spots).
-
-## Convention: commit a catalog file, don't assume a command
-
-`stylus-cli` can never dump an application's catalog itself — the `{name, id}` registry only
-exists inside the memory of a specific compiled binary that actually has `#[traceable]`
-functions linked into it (that's the whole reason `stylus::catalog::catalog_json()` is a library
-call the app makes itself, not a `stylus-cli` subcommand). Rather than standardizing on some
-fixed CLI invocation and hoping every app's binary happens to support it the same way, the
-convention is simpler and more robust: **commit the catalog as a JSON file in the repo** (e.g.
-`stylus-catalog.json` at the root — see `stylus-demo`'s copy), produced once via
-`stylus::catalog::catalog_json()` from within the app however that app chooses to expose it, and
-regenerated whenever its `#[traceable]` functions change.
-
-A coding agent reconfiguring tracing should look for this committed file first. If it isn't
-there, or isn't easy to find, it should **ask the user to produce one** (using their app's own
-`stylus::catalog::catalog_json()`) and provide it — not guess a command and run it unprompted.
-
 ## For coding agents: `agents/AGENTS.md` and `agents/SKILL.md`
 
-Two copy-paste templates for any application built on `stylus`, so a coding agent (asked
-something like "trace the database" or "turn off tracing") can reconfigure it using *only*
-`stylus-cli encode` — no bespoke scripts, no reading this whole README.
+Two copy-paste templates for any application built on `stylus`, so a coding agent asked
+something like "trace the database" or "turn off tracing" can reconfigure it without reading
+this whole README.
 
 - `agents/AGENTS.md` → copy to the application repo's root as `AGENTS.md`.
 - `agents/SKILL.md` → copy to the application repo as a manually-invoked Claude Code skill, e.g.
   `.claude/skills/configure-tracing/SKILL.md`.
 
-Both expect a catalog JSON file to already be committed in the repo (per the convention above).
-If it's missing or not obviously located, they ask the user to produce and provide one, rather
-than trying to generate it themselves. See `stylus-demo/AGENTS.md` and
-`stylus-demo/.claude/skills/configure-tracing/SKILL.md` for a working copy.
+Both drive the application's own catalog and encode entry points (step 1 and 5), read its source
+to derive the call graph, then apply the child-only rule above so the resulting hierarchy holds
+together. They expect the app to expose those two entry points and ask the user if it doesn't.
+See `stylus-demo/AGENTS.md` and `stylus-demo/.claude/skills/configure-tracing/SKILL.md` for a
+working copy.
 
 ## Crate layout
 
@@ -341,8 +301,6 @@ than trying to generate it themselves. See `stylus-demo/AGENTS.md` and
   the `start_spans` hot path), `codec` (lossless delta-encoded id list encode/decode),
   `catalog` (the `{name, id}` dump and `all_names`).
 - `stylus-macros` — the `#[traceable]` proc-macro implementation.
-- `stylus-cli` — the standalone binary described above (built with `clap`): `encode` (ids
-  → encoded id list) and `graph` (source → call-graph edges, via `syn`).
 
 ## Benchmarks
 

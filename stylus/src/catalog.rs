@@ -5,8 +5,8 @@
 //! access, a script, an operator -- independently pick a subset and build the
 //! exact encoded string
 //! [`Instrumentation::set_enabled_encoded`](crate::instrumentation::Instrumentation::set_enabled_encoded)
-//! expects: read this catalog, pick functions by name or id, and either call
-//! [`crate::codec::encode`], or hand the chosen ids to `stylus-cli encode`.
+//! expects: read this catalog, pick functions by name, and pass their ids to
+//! [`crate::codec::encode`].
 //!
 //! An `id` is the function's index in the sorted set of registry keys (see
 //! [`crate::registry::names_by_id`]) -- dense, and stable across rebuilds and
@@ -25,8 +25,9 @@ use crate::registry;
 /// [`catalog`].
 ///
 /// This is the *node* list only. Call-graph edges (who calls whom) aren't
-/// known to the running binary -- they're added by static source analysis
-/// (`stylus-cli graph`), which augments this dump with `callers`/`callees`.
+/// known to the running binary; whoever picks a subset derives them from the
+/// source, which is what decides who can root a trace and who must be
+/// child-only.
 #[derive(Debug, Serialize)]
 pub struct FunctionEntry {
     /// The registry key -- `module_path!() + "::" + fn_name`, or the
