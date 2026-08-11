@@ -9,7 +9,7 @@
 //!
 //! ```ignore
 //! let provider = /* some SdkTracerProvider */;
-//! let checkout = stylus::instrumentation::Instrumentation::builder()
+//! let checkout = beatrace::instrumentation::Instrumentation::builder()
 //!     .name("checkout-debug")
 //!     .tracer(provider.tracer("checkout-debug"))
 //!     .build()
@@ -38,9 +38,9 @@
 //! * An incoming `traceparent` is **not** joined. A propagator deposits the
 //!   remote parent in `Context`'s span slot, which no instrumentation consults,
 //!   so the first traced function on a call path always roots a fresh trace.
-//!   By the same token, a span created outside stylus -- a web framework's
+//!   By the same token, a span created outside beatrace -- a web framework's
 //!   server span, a hand-rolled `tracer.start()` -- is never a parent either.
-//! * Outbound `traceparent` headers carry nothing from stylus, since
+//! * Outbound `traceparent` headers carry nothing from beatrace, since
 //!   propagators inject whatever is in that same span slot.
 //!
 //! An instrumentation's spans nest only under other `#[traceable]` spans of
@@ -391,7 +391,7 @@ impl InstrumentationBuilder {
             .tracer
             .expect("InstrumentationBuilder::build requires a tracer");
 
-        let mut slots = SLOTS.lock().expect("stylus slot allocator poisoned");
+        let mut slots = SLOTS.lock().expect("beatrace slot allocator poisoned");
         let slot = if let Some(slot) = slots.freed.pop() {
             slot
         } else if u32::from(slots.next) < MAX_INSTRUMENTATIONS {
@@ -495,7 +495,7 @@ impl Drop for Instrumentation {
         // so the next occupant can't be reached through this one's leftovers.
         SLOTS
             .lock()
-            .expect("stylus slot allocator poisoned")
+            .expect("beatrace slot allocator poisoned")
             .freed
             .push(slot);
     }

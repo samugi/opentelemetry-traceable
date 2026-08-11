@@ -1,5 +1,5 @@
 [package]
-name = "stylus"
+name = "beatrace"
 version = { workspace = true }
 edition = { workspace = true }
 
@@ -8,7 +8,7 @@ base64 = { workspace = true }
 leb128 = { workspace = true }
 linkme = { workspace = true }
 opentelemetry = { workspace = true }
-stylus-macros = { path = "../stylus-macros", version = "0.1.0" }
+beatrace-macros = { path = "../beatrace-macros", version = "0.1.0" }
 arc-swap = { workspace = true }
 smallvec = { workspace = true }
 serde = { workspace = true }

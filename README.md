@@ -1,4 +1,4 @@
-# stylus
+# beatrace
 
 Dynamic, per-function tracing on top of [`opentelemetry-rust`](https://github.com/open-telemetry/opentelemetry-rust).
 Annotate any `fn`/`async fn` with `#[traceable]`, then enable or disable tracing for it at
@@ -10,7 +10,7 @@ without recompiling.
 Annotate the functions you might one day want traced:
 
 ```rust
-use stylus::traceable;
+use beatrace::traceable;
 
 #[traceable]
 fn process() { /* ... */ }
@@ -28,7 +28,7 @@ own `Tracer`, holds its own enabled subset, and builds its own isolated span hie
 
 ```rust
 use opentelemetry::trace::TracerProvider as _;
-use stylus::instrumentation::Instrumentation;
+use beatrace::instrumentation::Instrumentation;
 
 let provider = /* your own opentelemetry_sdk::trace::SdkTracerProvider */;
 
@@ -82,7 +82,7 @@ instr.set_child_only_encoded(&encoded)?; // replace the child-only set
 instr.enabled_names();                   // -> impl Iterator<Item = &'static str>, read-only
 instr.child_only_names();                // -> impl Iterator<Item = &'static str>, read-only
 
-stylus::catalog::all_names();            // -> every registered key, regardless of instrumentation
+beatrace::catalog::all_names();            // -> every registered key, regardless of instrumentation
 ```
 
 `enabled_names` / `child_only_names` are introspection only — configuration always goes in as
@@ -138,9 +138,9 @@ dropped deliberately as a consequence:
 - **An incoming `traceparent` is not joined.** A propagator deposits the remote parent in
   `Context`'s span slot, which no instrumentation consults, so the first traced function on a call
   path always roots a fresh trace.
-- **A span created outside stylus is never a parent** either — not a web framework's server span,
+- **A span created outside beatrace is never a parent** either — not a web framework's server span,
   not a hand-rolled `tracer.start()`.
-- **Outbound requests carry no `traceparent` from stylus**, since propagators inject whatever is in
+- **Outbound requests carry no `traceparent` from beatrace**, since propagators inject whatever is in
   that same span slot.
 
 An instrumentation's spans nest only under other `#[traceable]` spans of that *same*
@@ -181,23 +181,23 @@ workflow below applies.
 
 ## Compact subset encoding
 
-`stylus::codec` encodes an arbitrary selection of functions as a **lossless delta-encoded id
+`beatrace::codec` encodes an arbitrary selection of functions as a **lossless delta-encoded id
 list** instead of a name list. The ids are sorted, turned into LEB128 varint deltas, then
 base64'd (URL-safe, unpadded). There are **no false positives**: exactly the listed functions
 are toggled, nothing else.
 
 ```rust
 let mut ids = vec![0, 3, 7];
-let encoded = stylus::codec::encode(&mut ids);
+let encoded = beatrace::codec::encode(&mut ids);
 instr.set_enabled_encoded(&encoded)?;   // replace the whole enabled set
 instr.enable_encoded(&encoded)?;        // additive
 instr.disable_encoded(&encoded)?;       // subtractive
 ```
 
 An `id` is a `#[traceable]` function's index in the **sorted set of registry keys**
-(`stylus::registry::names_by_id`): dense, 0-based, and reported by `stylus::catalog`. Sorting is
+(`beatrace::registry::names_by_id`): dense, 0-based, and reported by `beatrace::catalog`. Sorting is
 done in place, which is why `encode` takes `&mut [u64]`. Decoding is
-`stylus::codec::decode(&str) -> Result<Vec<u64>, stylus::codec::DecodeError>`; a corrupt string
+`beatrace::codec::decode(&str) -> Result<Vec<u64>, beatrace::codec::DecodeError>`; a corrupt string
 returns `Err(DecodeError)` and leaves state unchanged.
 
 Ids are build-scoped, not instrumentation-scoped: the same encoded string means the same set of
@@ -230,13 +230,13 @@ access but isn't running Rust, or is choosing from thousands of candidates and c
 reasonably be handed a plain name list:
 
 1. **Dump the catalog.** From within your instrumented application (an admin endpoint, a debug
-   CLI flag, a one-off example — `stylus` has no way to know how *your* app wants to expose
+   CLI flag, a one-off example — `beatrace` has no way to know how *your* app wants to expose
    this, so it just provides the data):
    ```rust
-   let json = stylus::catalog::catalog_json();
+   let json = beatrace::catalog::catalog_json();
    ```
    This returns every `#[traceable]` function currently linked into the binary, each with the
-   same registry-index id `stylus::codec` uses internally:
+   same registry-index id `beatrace::codec` uses internally:
    ```json
    {
      "functions": [
@@ -256,11 +256,11 @@ reasonably be handed a plain name list:
 3. **Turn the picks into an encoded id list:**
    ```rust
    let mut ids = chosen_ids;
-   let encoded = stylus::codec::encode(&mut ids);
+   let encoded = beatrace::codec::encode(&mut ids);
    ```
    Expose that the same way you exposed the catalog, so the consumer can encode its own picks
    without writing Rust — the ids index this binary's registry, so nothing outside it can do the
-   encoding on its behalf. (`stylus-demo` wires both up as `catalog` and `encode --ids`
+   encoding on its behalf. (`beatrace-demo` wires both up as `catalog` and `encode --ids`
    subcommands.)
 4. **Apply it** to the instrumentation that should trace that subset:
    `instr.set_enabled_encoded(&encoded)?`.
@@ -279,7 +279,7 @@ Simple enough to reimplement in a short script, given a catalog dump's list of c
 
 ## For coding agents: `agents/AGENTS.md` and `agents/SKILL.md`
 
-Two copy-paste templates for any application built on `stylus`, so a coding agent asked
+Two copy-paste templates for any application built on `beatrace`, so a coding agent asked
 something like "trace the database" or "turn off tracing" can reconfigure it without reading
 this whole README.
 
@@ -290,25 +290,25 @@ this whole README.
 Both drive the application's own catalog and encode entry points (step 1 and 5), read its source
 to derive the call graph, then apply the child-only rule above so the resulting hierarchy holds
 together. They expect the app to expose those two entry points and ask the user if it doesn't.
-See `stylus-demo/AGENTS.md` and `stylus-demo/.claude/skills/configure-tracing/SKILL.md` for a
+See `beatrace-demo/AGENTS.md` and `beatrace-demo/.claude/skills/configure-tracing/SKILL.md` for a
 working copy.
 
 ## Crate layout
 
-- `stylus` — runtime: `#[traceable]` re-export, `registry` (the `linkme`-collected
+- `beatrace` — runtime: `#[traceable]` re-export, `registry` (the `linkme`-collected
   `TraceSite`/`REGISTRY`, one enabled/child-only bitmask pair per site), `instrumentation`
   (`Instrumentation` + its builder — creating, configuring, and dropping instrumentations, plus
   the `start_spans` hot path), `codec` (lossless delta-encoded id list encode/decode),
   `catalog` (the `{name, id}` dump and `all_names`).
-- `stylus-macros` — the `#[traceable]` proc-macro implementation.
+- `beatrace-macros` — the `#[traceable]` proc-macro implementation.
 
 ## Benchmarks
 
-`stylus/benches/traceable_overhead.rs` (Criterion) runs the same CPU-bound workload (1000
+`beatrace/benches/traceable_overhead.rs` (Criterion) runs the same CPU-bound workload (1000
 iterations) through a plain function, through `#[traceable]` with nothing tracing it, through
 `#[traceable]` with one and then two live instrumentations (real in-process span exporters, not
 no-op tracers), and through `#[tracing::instrument]` for comparison. Run with
-`cargo bench -p stylus`. Representative local numbers:
+`cargo bench -p beatrace`. Representative local numbers:
 
 | variant                          | time      |
 | -------------------------------- | --------- |

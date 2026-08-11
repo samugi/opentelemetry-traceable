@@ -1,6 +1,6 @@
-# Configuring stylus tracing in this repo
+# Configuring beatrace tracing in this repo
 
-This application uses [`stylus`](https://github.com/samugi/stylus) for dynamic, per-function
+This application uses [`beatrace`](https://github.com/samugi/beatrace) for dynamic, per-function
 tracing: any `#[traceable]` function can be turned on or off at runtime by editing a local
 config file. When asked to change what's traced (e.g. "trace the database", "trace checkout
 end-to-end", "turn off tracing"), follow this procedure step by step.
@@ -18,14 +18,14 @@ no false positives. An id is a function's index in the sorted set of registry ke
 stable across rebuilds, but adding or removing a `#[traceable]` function renumbers them, so
 always take ids from a catalog produced by the current binary (step 1).
 
-Two properties of `stylus` constrain the sets you compute:
+Two properties of `beatrace` constrain the sets you compute:
 
 - Both lists belong to **one instrumentation**. There is no global or default one — nothing
   traces unless an instrumentation carries these values — and "already has a recording span"
   always means *a span from that same instrumentation*. If the config defines more than one and
   the user didn't say which, stop and ask.
-- Only an enabled, **non**-child-only function can start a trace. `stylus` does not join an
-  incoming `traceparent`, and a span created outside `stylus` (a web framework's server span, a
+- Only an enabled, **non**-child-only function can start a trace. `beatrace` does not join an
+  incoming `traceparent`, and a span created outside `beatrace` (a web framework's server span, a
   hand-rolled `tracer.start()`) is never a parent. Never count on an outer span to root the
   trace: if everything in your selection ends up child-only, nothing spans at all.
 
@@ -40,10 +40,10 @@ authoritative set of what can be traced, and the only source of ids.
 
 Only the application's own binary can produce it: the registry is built at link time from the
 `#[traceable]` functions compiled into *it*. So use whatever command this app exposes over
-`stylus::catalog::catalog_json()`. For a Rust binary that's typically:
+`beatrace::catalog::catalog_json()`. For a Rust binary that's typically:
 
 ```
-cargo run --quiet -- catalog > /tmp/stylus-catalog.json
+cargo run --quiet -- catalog > /tmp/beatrace-catalog.json
 ```
 
 If you can't find such a command, **ask the user** how this app exposes its catalog. Don't
@@ -71,7 +71,7 @@ hierarchy holds together:
   edge can silently break the hierarchy.
 - **Macro-generated calls** — resolve by reading the macro, or treat as ambiguous per above.
 - **Calls across a task or thread boundary** (`tokio::spawn`, `std::thread::spawn`, work handed
-  to a channel and run elsewhere) — **not** a parent/child edge. `stylus` propagates through the
+  to a channel and run elsewhere) — **not** a parent/child edge. `beatrace` propagates through the
   ambient `opentelemetry::Context`, which a spawned task does not inherit, so a function first
   reached that way starts with no parent. Leave it out of `callers` and step 4 will keep it
   root-capable; mark it child-only and it goes silent instead.
@@ -120,7 +120,7 @@ cargo run --quiet -- encode --ids <every id in CO>     # -> child_only
 ```
 
 Order of ids doesn't matter. If the app exposes no encode command, it can be added in two lines
-over `stylus::codec::encode`; ask the user rather than improvising an encoder.
+over `beatrace::codec::encode`; ask the user rather than improvising an encoder.
 
 ## 6. Update the config, then verify
 

@@ -9,9 +9,9 @@
 //! global `AtomicBool`, checked on every call via `tracing_subscriber`'s
 //! `DynFilterFn` (which reports `Interest::sometimes()` rather than letting
 //! `tracing` cache a fixed answer per callsite -- the same "recheck every
-//! call" semantics `stylus` relies on). The "enabled" case is wired through
+//! call" semantics `beatrace` relies on). The "enabled" case is wired through
 //! `tracing-opentelemetry` to the exact same `SdkTracerProvider` and
-//! `InMemorySpanExporter` the `stylus` "enabled" benchmark uses, so both
+//! `InMemorySpanExporter` the `beatrace` "enabled" benchmark uses, so both
 //! pay for real span construction and export, not a no-op stub -- an
 //! apples-to-apples comparison rather than a hand-wavy one.
 
@@ -24,8 +24,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracer, SdkTracerProvider};
-use stylus::instrumentation::Instrumentation;
-use stylus::traceable;
+use beatrace::instrumentation::Instrumentation;
+use beatrace::traceable;
 use tracing_subscriber::filter::DynFilterFn;
 use tracing_subscriber::prelude::*;
 
@@ -51,17 +51,17 @@ fn traceable_fn(n: u64) -> u64 {
 }
 
 /// Gate for the `tracing`-based equivalent below -- read on every call via
-/// `DynFilterFn`, mirroring the per-site `AtomicBool` `stylus` checks on
+/// `DynFilterFn`, mirroring the per-site `AtomicBool` `beatrace` checks on
 /// every call in `registry::TraceSite`.
 static TRACING_GATE: AtomicBool = AtomicBool::new(false);
 
 /// Sets the global default `tracing` subscriber once: `tracing_subscriber`'s
 /// `registry()` layered with `tracing-opentelemetry`'s bridge (real span
-/// export via `tracer`, the same kind of `SdkTracer` the `stylus` benchmark
+/// export via `tracer`, the same kind of `SdkTracer` the `beatrace` benchmark
 /// uses), filtered by a `DynFilterFn` reading `TRACING_GATE`. `DynFilterFn`'s
 /// callsite interest is `sometimes()` (it can't assume the closure's answer
 /// is fixed), so the gate is re-evaluated on every call rather than cached
-/// after the first check -- same dynamic-enable semantics as `stylus`.
+/// after the first check -- same dynamic-enable semantics as `beatrace`.
 fn init_tracing_subscriber(tracer: SdkTracer) {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {

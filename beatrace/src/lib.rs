@@ -17,4 +17,4 @@ pub mod codec;
 pub mod instrumentation;
 pub mod registry;
 
-pub use stylus_macros::traceable;
+pub use beatrace_macros::traceable;

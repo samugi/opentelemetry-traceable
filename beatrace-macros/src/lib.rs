@@ -3,7 +3,7 @@
 //! Uses an `#[in_span]`-style argument surface (`name`,
 //! `fields(key = expr, ...)`), but gates span creation behind a per-function
 //! bitmask discovered at link time via `linkme` (one bit per
-//! `stylus::instrumentation` slot), so tracing can be toggled per function --
+//! `beatrace::instrumentation` slot), so tracing can be toggled per function --
 //! and per instrumentation -- at runtime without recompiling. There is no
 //! `tracer` argument: each instrumentation brings its own tracer, so a call site
 //! has nothing to name.
@@ -98,7 +98,7 @@ impl Parse for TraceableArgs {
 /// Every call checks a per-function, link-time-registered bitmask before doing
 /// any span/context work, so a function no instrumentation is tracing costs a
 /// single atomic load. Enable it at runtime through a
-/// `stylus::instrumentation::Instrumentation`, which supplies the tracer the
+/// `beatrace::instrumentation::Instrumentation`, which supplies the tracer the
 /// span is created from — the macro itself never names or looks up a tracer.
 ///
 /// The registry key used to enable a function defaults to
@@ -168,14 +168,14 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
     // if every active slot was child-only-suppressed.
     let traced = if is_async {
         quote! {
-            ::opentelemetry::trace::FutureExt::with_context(async #block, __stylus_cx).await
+            ::opentelemetry::trace::FutureExt::with_context(async #block, __beatrace_cx).await
         }
     } else {
         quote! {
-            let __stylus_guard = __stylus_cx.attach();
-            let __stylus_ret = #block;
-            ::std::mem::drop(__stylus_guard);
-            __stylus_ret
+            let __beatrace_guard = __beatrace_cx.attach();
+            let __beatrace_ret = #block;
+            ::std::mem::drop(__beatrace_guard);
+            __beatrace_ret
         }
     };
 
@@ -186,23 +186,23 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
     quote! {
         #(#attrs)*
         #vis #sig {
-            #[::linkme::distributed_slice(::stylus::registry::REGISTRY)]
-            static __STYLUS_SITE: ::stylus::registry::TraceSite =
-                ::stylus::registry::TraceSite::new(#registry_key);
+            #[::linkme::distributed_slice(::beatrace::registry::REGISTRY)]
+            static __BEATRACE_SITE: ::beatrace::registry::TraceSite =
+                ::beatrace::registry::TraceSite::new(#registry_key);
 
-            let __stylus_mask =
-                __STYLUS_SITE.enabled_mask.load(::std::sync::atomic::Ordering::Relaxed);
-            if __stylus_mask == 0u64 {
+            let __beatrace_mask =
+                __BEATRACE_SITE.enabled_mask.load(::std::sync::atomic::Ordering::Relaxed);
+            if __beatrace_mask == 0u64 {
                 #block
             } else {
-                match ::stylus::instrumentation::start_spans(
-                    __stylus_mask,
-                    __STYLUS_SITE.child_only_mask.load(::std::sync::atomic::Ordering::Relaxed),
+                match ::beatrace::instrumentation::start_spans(
+                    __beatrace_mask,
+                    __BEATRACE_SITE.child_only_mask.load(::std::sync::atomic::Ordering::Relaxed),
                     #span_name,
                     ::std::vec![#(#kvs),*],
                 ) {
                     ::std::option::Option::None => #block,
-                    ::std::option::Option::Some(__stylus_cx) => { #traced }
+                    ::std::option::Option::Some(__beatrace_cx) => { #traced }
                 }
             }
         }

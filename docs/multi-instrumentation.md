@@ -1,7 +1,7 @@
 # Design: instrumentations
 
 > Status: **implemented**. This document is the design record for
-> `stylus::instrumentation`. It captures the problem, the approach, the
+> `beatrace::instrumentation`. It captures the problem, the approach, the
 > alternatives that were rejected and *why*, and the measured performance
 > outcome.
 >
@@ -13,7 +13,7 @@
 
 ## Problem
 
-Originally `stylus` was single-config: each `#[traceable]` function's
+Originally `beatrace` was single-config: each `#[traceable]` function's
 `TraceSite` carried one `enabled: AtomicBool` + one `child_only: AtomicBool`,
 and the macro's enabled path always reached for the single process-wide
 `opentelemetry::global::tracer(name)` and nested under the single ambient
@@ -67,11 +67,11 @@ identical cost to the old `AtomicBool` fast path.
 
 ### 2. Two-way macro dispatch
 
-`stylus-macros` `expand()` dispatches on the loaded `enabled_mask`:
+`beatrace-macros` `expand()` dispatches on the loaded `enabled_mask`:
 
 - **`== 0`** → run the original body, no machinery. One atomic load.
 - **anything else** → delegate to
-  `stylus::instrumentation::start_spans(mask, child_only_mask, span_name, attrs)`.
+  `beatrace::instrumentation::start_spans(mask, child_only_mask, span_name, attrs)`.
 
 This *used* to be a three-way dispatch, with a middle `== 1` case that was
 byte-identical to pre-multi-instrumentation codegen (`global::tracer(name)` +
@@ -166,7 +166,7 @@ that asymmetry was its entire remaining purpose:
 - **Inbound:** it parented off `Context::current()`, so a propagator-extracted
   remote parent (`extract_with_context` → `cx.with_remote_span_context(sc)`,
   which lands in `.span`) became the parent — the process joined the incoming
-  distributed trace. It likewise nested under any span made outside stylus.
+  distributed trace. It likewise nested under any span made outside beatrace.
 - **Outbound:** because its span occupied `.span`,
   `TraceContextPropagator::inject_context` (which reads exactly `cx.span()`)
   emitted it into the `traceparent` header.
@@ -192,7 +192,7 @@ happens to those two capabilities. Three options were weighed:
 `DEFAULT_SLOT`, no slot-0 branch in `start_spans`, no `slot0_cx`/`env_changed`
 bookkeeping, no `global::tracer` lookup, and no `tracer = "..."` macro argument
 (a call site has nothing to name once every instrumentation brings its own
-tracer). `stylus::config` was deleted outright.
+tracer). `beatrace::config` was deleted outright.
 
 ### The resulting documented limitation
 
@@ -201,9 +201,9 @@ Instrumentations are **in-process only**. Their spans live exclusively in the
 
 - an incoming `traceparent` is not joined — the first traced function on a call
   path always roots a fresh trace;
-- a span created outside stylus (a web framework's server span, a hand-rolled
+- a span created outside beatrace (a web framework's server span, a hand-rolled
   `tracer.start()`) is never a parent;
-- outbound `traceparent` headers carry nothing from stylus.
+- outbound `traceparent` headers carry nothing from beatrace.
 
 An instrumentation's spans nest only under other `#[traceable]` spans of that
 same instrumentation. In-process nesting itself is unaffected and works across
@@ -287,14 +287,14 @@ Consequences worth noting:
 
 ## Files
 
-- `stylus/src/registry.rs` — `TraceSite` masks, and the sorted-key id ordering
+- `beatrace/src/registry.rs` — `TraceSite` masks, and the sorted-key id ordering
   (`names_by_id` / `name_by_id` / `id_of_name`).
-- `stylus/src/instrumentation.rs` — `Instrumentation`, `InstrumentationBuilder`,
+- `beatrace/src/instrumentation.rs` — `Instrumentation`, `InstrumentationBuilder`,
   constants, `ArcSwap` slot table, free-list allocator, shared bit-op helpers,
   `DynTracer`, `MultiInstrumentState`, `start_spans`.
-- `stylus/src/catalog.rs` — the `{name, id}` node dump, plus `all_names`.
-- `stylus/src/codec.rs` — `encode`/`decode`/`DecodeError` for subset strings.
-- `stylus-macros/src/lib.rs` — two-way `expand()` dispatch.
-- `stylus/tests/traceable.rs` — isolation/nesting/coexistence/child-only/drop
+- `beatrace/src/catalog.rs` — the `{name, id}` node dump, plus `all_names`.
+- `beatrace/src/codec.rs` — `encode`/`decode`/`DecodeError` for subset strings.
+- `beatrace-macros/src/lib.rs` — two-way `expand()` dispatch.
+- `beatrace/tests/traceable.rs` — isolation/nesting/coexistence/child-only/drop
   tests, slot-reuse churn, and the in-process-only assertions.
-- `stylus/benches/traceable_overhead.rs` — per-instrumentation-count cases.
+- `beatrace/benches/traceable_overhead.rs` — per-instrumentation-count cases.

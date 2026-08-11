@@ -13,7 +13,7 @@
 //! build profiles. Regenerate this catalog when you add or remove a
 //! `#[traceable]` function, which renumbers the ids after it.
 //!
-//! `stylus` has no way to know how a given application wants to expose this
+//! `beatrace` has no way to know how a given application wants to expose this
 //! (an admin endpoint, a debug CLI flag, a one-off script) -- it only
 //! provides the data.
 

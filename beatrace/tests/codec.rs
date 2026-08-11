@@ -1,6 +1,6 @@
 //! Round-trip and robustness tests for the lossless subset codec.
 
-use stylus::codec::{decode, encode};
+use beatrace::codec::{decode, encode};
 
 #[test]
 fn round_trips_an_arbitrary_id_set() {

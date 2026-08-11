@@ -1,9 +1,9 @@
 ---
 name: configure-tracing
-description: Turn stylus tracing on or off for a subset of this app's functions, described in plain English (e.g. "trace the database", "trace the payment gateway", "turn off tracing"). Manually invoked -- run explicitly when asked to change what's traced.
+description: Turn beatrace tracing on or off for a subset of this app's functions, described in plain English (e.g. "trace the database", "trace the payment gateway", "turn off tracing"). Manually invoked -- run explicitly when asked to change what's traced.
 ---
 
-This application uses `stylus` for dynamic, per-function tracing: any `#[traceable]` function can
+This application uses `beatrace` for dynamic, per-function tracing: any `#[traceable]` function can
 be turned on or off at runtime by editing a local config file. `args` is the request in plain
 English (e.g. "trace the database"). Follow this procedure step by step, in order.
 
@@ -17,13 +17,13 @@ An id is a function's index in the sorted set of registry keys. Ids are stable a
 but adding or removing a `#[traceable]` function renumbers them, so always take ids from a
 catalog produced by the current binary (step 1).
 
-Two properties of `stylus` constrain the sets you compute:
+Two properties of `beatrace` constrain the sets you compute:
 
 - Both lists belong to **one instrumentation**. There is no global or default one, and "already
   has a recording span" always means *a span from that same instrumentation*. If the config
   defines more than one and the user didn't say which, stop and ask.
-- Only an enabled, **non**-child-only function can start a trace. `stylus` does not join an
-  incoming `traceparent`, and a span created outside `stylus` (a framework's server span, a
+- Only an enabled, **non**-child-only function can start a trace. `beatrace` does not join an
+  incoming `traceparent`, and a span created outside `beatrace` (a framework's server span, a
   hand-rolled `tracer.start()`) is never a parent — so never count on an outer span to root the
   trace. If everything in your selection ends up child-only, nothing spans at all.
 
@@ -34,9 +34,9 @@ To trace everything, get the catalog (step 1) and encode every id in it as `enab
 1. **Get the catalog** — the `{name, id}` list of every `#[traceable]` function in the binary,
    which is both the authoritative set of what can be traced and the only source of ids. Only
    the app's own binary can produce it (the registry is linked into *it*), so use whatever
-   command this app exposes over `stylus::catalog::catalog_json()`; for a Rust binary, typically:
+   command this app exposes over `beatrace::catalog::catalog_json()`; for a Rust binary, typically:
    ```
-   cargo run --quiet -- catalog > /tmp/stylus-catalog.json
+   cargo run --quiet -- catalog > /tmp/beatrace-catalog.json
    ```
    If there's no such command, **ask the user** how this app exposes its catalog. Don't
    substitute a list grepped out of the source — guessed ids silently trace the wrong functions.
@@ -58,7 +58,7 @@ To trace everything, get the catalog (step 1) and encode every id in it as `enab
      silently break the hierarchy.
    - **Macro-generated calls** — resolve by reading the macro, or treat as ambiguous per above.
    - **Calls across a task or thread boundary** (`tokio::spawn`, `std::thread::spawn`, work sent
-     over a channel) — **not** a parent/child edge. `stylus` propagates through the ambient
+     over a channel) — **not** a parent/child edge. `beatrace` propagates through the ambient
      `opentelemetry::Context`, which a spawned task doesn't inherit, so a function first reached
      that way has no parent. Leave it out of `callers` and step 4 keeps it root-capable; mark it
      child-only and it goes silent instead.
@@ -97,7 +97,7 @@ To trace everything, get the catalog (step 1) and encode every id in it as `enab
    cargo run --quiet -- encode --ids <every id in CO>    # -> child_only
    ```
    If the app exposes no encode command, it can be added in two lines over
-   `stylus::codec::encode`; ask the user rather than improvising an encoder.
+   `beatrace::codec::encode`; ask the user rather than improvising an encoder.
 
 6. **Update the config, then verify.** Find the local config — commonly `config.yaml` /
    `config.json` at the repo root. The two fields belong to **one instrumentation**: expect a
