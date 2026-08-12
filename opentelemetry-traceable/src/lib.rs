@@ -17,4 +17,15 @@ pub mod codec;
 pub mod instrumentation;
 pub mod registry;
 
-pub use beatrace_macros::traceable;
+pub use opentelemetry_traceable_macros::traceable;
+
+/// Re-exported so downstream crates never need their own `opentelemetry` dependency
+/// (for `#[traceable]`'s expansion or for `Instrumentation::tracer`/`Context`/`KeyValue`),
+/// and so it's structurally impossible for their code to resolve a different
+/// `opentelemetry` than this crate was built against.
+pub use opentelemetry;
+
+#[doc(hidden)]
+pub mod __private {
+    pub use linkme;
+}

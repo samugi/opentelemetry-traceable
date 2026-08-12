@@ -1,5 +1,5 @@
 [package]
-name = "beatrace-macros"
+name = "opentelemetry-traceable-macros"
 version = { workspace = true }
 edition = { workspace = true }
 

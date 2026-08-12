@@ -1,5 +1,5 @@
 [package]
-name = "beatrace"
+name = "opentelemetry-traceable"
 version = { workspace = true }
 edition = { workspace = true }
 
@@ -8,7 +8,7 @@ base64 = { workspace = true }
 leb128 = { workspace = true }
 linkme = { workspace = true }
 opentelemetry = { workspace = true }
-beatrace-macros = { path = "../beatrace-macros", version = "0.1.0" }
+opentelemetry-traceable-macros = { path = "../opentelemetry-traceable-macros", version = "0.1.0" }
 arc-swap = { workspace = true }
 smallvec = { workspace = true }
 serde = { workspace = true }

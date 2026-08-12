@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["beatrace", "beatrace-macros"]
+members = ["opentelemetry-traceable", "opentelemetry-traceable-macros"]
 
 [workspace.package]
 version = "0.1.0"

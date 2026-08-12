@@ -15,8 +15,8 @@ use opentelemetry::trace::{
     SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TracerProvider as _,
 };
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
-use beatrace::instrumentation::Instrumentation;
-use beatrace::traceable;
+use opentelemetry_traceable::instrumentation::Instrumentation;
+use opentelemetry_traceable::traceable;
 
 /// Build an instrumentation with its own in-memory exporter/provider. The
 /// returned exporter observes only this instrumentation's spans; the tracer
@@ -38,7 +38,7 @@ fn instr(name: &'static str) -> (Instrumentation, InMemorySpanExporter) {
 /// catalog (the same mapping an application would use), then delta-encode the
 /// ids. Panics if a name isn't a known trace site.
 fn encode_names(names: &[&str]) -> String {
-    let catalog = beatrace::catalog::catalog();
+    let catalog = opentelemetry_traceable::catalog::catalog();
     let mut ids: Vec<u64> = names
         .iter()
         .map(|name| {
@@ -50,7 +50,7 @@ fn encode_names(names: &[&str]) -> String {
                 .id
         })
         .collect();
-    beatrace::codec::encode(&mut ids)
+    opentelemetry_traceable::codec::encode(&mut ids)
 }
 
 #[traceable]
@@ -285,7 +285,8 @@ fn set_enabled_encoded_replaces_the_active_subset() {
 // should show up here even without being invoked in this test.
 #[test]
 fn registry_discovers_all_traceable_functions_in_this_binary() {
-    let names: std::collections::HashSet<_> = beatrace::catalog::all_names().collect();
+    let names: std::collections::HashSet<_> =
+        opentelemetry_traceable::catalog::all_names().collect();
     assert!(names.contains("custom.span"));
     assert!(names.contains("nesting::parent"));
     assert!(names.contains("nesting::child"));
@@ -348,7 +349,7 @@ fn catalog_reports_every_traceable_function_with_a_matching_id() {
     parent();
     Widget.render();
 
-    let catalog = beatrace::catalog::catalog();
+    let catalog = opentelemetry_traceable::catalog::catalog();
 
     // Ids are dense registry indices: `0..n`, each reported exactly once.
     let mut ids: Vec<u64> = catalog.functions.iter().map(|f| f.id).collect();
@@ -368,12 +369,12 @@ fn catalog_reports_every_traceable_function_with_a_matching_id() {
         "widget::render",
     ] {
         assert!(by_name.contains_key(name), "{name} missing from catalog");
-        let decoded = beatrace::codec::decode(&encode_names(&[name])).unwrap();
+        let decoded = opentelemetry_traceable::codec::decode(&encode_names(&[name])).unwrap();
         assert_eq!(decoded, vec![by_name[name]]);
     }
 
     // catalog_json() must be well-formed JSON containing the same data.
-    let json = beatrace::catalog::catalog_json();
+    let json = opentelemetry_traceable::catalog::catalog_json();
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert!(parsed["functions"].as_array().unwrap().len() >= catalog.functions.len());
 }
@@ -385,9 +386,9 @@ fn ids_depend_only_on_the_sorted_set_of_registry_keys() {
     // what makes an encoded subset survive a rebuild: nothing about linker
     // layout, an unrelated edit, moving a function within its file, or the build
     // profile can perturb it. Only adding/removing a key can.
-    let names = beatrace::registry::names_by_id();
+    let names = opentelemetry_traceable::registry::names_by_id();
 
-    let mut expected: Vec<&str> = beatrace::catalog::all_names().collect();
+    let mut expected: Vec<&str> = opentelemetry_traceable::catalog::all_names().collect();
     expected.sort_unstable();
     expected.dedup();
     assert_eq!(
@@ -397,7 +398,7 @@ fn ids_depend_only_on_the_sorted_set_of_registry_keys() {
 
     // Ids are dense 0..n: the catalog is exactly the sorted key order, position
     // for position, with each entry's id equal to its index.
-    let catalog = beatrace::catalog::catalog();
+    let catalog = opentelemetry_traceable::catalog::catalog();
     assert_eq!(catalog.functions.len(), names.len());
     for (id, name) in names.iter().enumerate() {
         let entry = &catalog.functions[id];
@@ -418,7 +419,7 @@ fn spans_never_land_in_the_ambient_context_span_slot() {
     // The probe reports what it sees in `Context::current().span()` from inside
     // its own traced body. A span *was* created for it (asserted below), but it
     // lives in the extension envelope, so the span slot stays empty -- which is
-    // exactly why outbound `traceparent` injection carries nothing from beatrace.
+    // exactly why outbound `traceparent` injection carries nothing from opentelemetry-traceable.
     let saw_ambient_span = probe_ambient();
 
     assert!(
@@ -742,7 +743,7 @@ fn dropping_an_instrumentation_stops_new_spans_and_frees_its_slot() {
 fn slots_are_reused_so_churn_does_not_exhaust_them() {
     // Build and drop well past MAX_INSTRUMENTATIONS one at a time. With a bump
     // allocator this would fail partway through; with slot reuse it can't.
-    let total = beatrace::instrumentation::MAX_INSTRUMENTATIONS * 3;
+    let total = opentelemetry_traceable::instrumentation::MAX_INSTRUMENTATIONS * 3;
     for i in 0..total {
         let (one, exporter) = instr("churn");
         one.enable_encoded(&encode_names(&["nesting::child"]))

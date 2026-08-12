@@ -3,7 +3,7 @@
 //! Uses an `#[in_span]`-style argument surface (`name`,
 //! `fields(key = expr, ...)`), but gates span creation behind a per-function
 //! bitmask discovered at link time via `linkme` (one bit per
-//! `beatrace::instrumentation` slot), so tracing can be toggled per function --
+//! `opentelemetry_traceable::instrumentation` slot), so tracing can be toggled per function --
 //! and per instrumentation -- at runtime without recompiling. There is no
 //! `tracer` argument: each instrumentation brings its own tracer, so a call site
 //! has nothing to name.
@@ -98,7 +98,7 @@ impl Parse for TraceableArgs {
 /// Every call checks a per-function, link-time-registered bitmask before doing
 /// any span/context work, so a function no instrumentation is tracing costs a
 /// single atomic load. Enable it at runtime through a
-/// `beatrace::instrumentation::Instrumentation`, which supplies the tracer the
+/// `opentelemetry_traceable::instrumentation::Instrumentation`, which supplies the tracer the
 /// span is created from — the macro itself never names or looks up a tracer.
 ///
 /// The registry key used to enable a function defaults to
@@ -158,7 +158,7 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
             .map(|f| {
                 let key = &f.key;
                 let value = &f.value;
-                quote! { ::opentelemetry::KeyValue::new(#key, #value) }
+                quote! { ::opentelemetry_traceable::opentelemetry::KeyValue::new(#key, #value) }
             })
             .collect(),
     };
@@ -168,14 +168,14 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
     // if every active slot was child-only-suppressed.
     let traced = if is_async {
         quote! {
-            ::opentelemetry::trace::FutureExt::with_context(async #block, __beatrace_cx).await
+            ::opentelemetry_traceable::opentelemetry::trace::FutureExt::with_context(async #block, __traceable_cx).await
         }
     } else {
         quote! {
-            let __beatrace_guard = __beatrace_cx.attach();
-            let __beatrace_ret = #block;
-            ::std::mem::drop(__beatrace_guard);
-            __beatrace_ret
+            let __traceable_guard = __traceable_cx.attach();
+            let __traceable_ret = #block;
+            ::std::mem::drop(__traceable_guard);
+            __traceable_ret
         }
     };
 
@@ -186,23 +186,24 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
     quote! {
         #(#attrs)*
         #vis #sig {
-            #[::linkme::distributed_slice(::beatrace::registry::REGISTRY)]
-            static __BEATRACE_SITE: ::beatrace::registry::TraceSite =
-                ::beatrace::registry::TraceSite::new(#registry_key);
+            #[::opentelemetry_traceable::__private::linkme::distributed_slice(::opentelemetry_traceable::registry::REGISTRY)]
+            #[linkme(crate = ::opentelemetry_traceable::__private::linkme)]
+            static __TRACEABLE_SITE: ::opentelemetry_traceable::registry::TraceSite =
+                ::opentelemetry_traceable::registry::TraceSite::new(#registry_key);
 
-            let __beatrace_mask =
-                __BEATRACE_SITE.enabled_mask.load(::std::sync::atomic::Ordering::Relaxed);
-            if __beatrace_mask == 0u64 {
+            let __traceable_mask =
+                __TRACEABLE_SITE.enabled_mask.load(::std::sync::atomic::Ordering::Relaxed);
+            if __traceable_mask == 0u64 {
                 #block
             } else {
-                match ::beatrace::instrumentation::start_spans(
-                    __beatrace_mask,
-                    __BEATRACE_SITE.child_only_mask.load(::std::sync::atomic::Ordering::Relaxed),
+                match ::opentelemetry_traceable::instrumentation::start_spans(
+                    __traceable_mask,
+                    __TRACEABLE_SITE.child_only_mask.load(::std::sync::atomic::Ordering::Relaxed),
                     #span_name,
                     ::std::vec![#(#kvs),*],
                 ) {
                     ::std::option::Option::None => #block,
-                    ::std::option::Option::Some(__beatrace_cx) => { #traced }
+                    ::std::option::Option::Some(__traceable_cx) => { #traced }
                 }
             }
         }

@@ -1,6 +1,6 @@
 //! Round-trip and robustness tests for the lossless subset codec.
 
-use beatrace::codec::{decode, encode};
+use opentelemetry_traceable::codec::{decode, encode};
 
 #[test]
 fn round_trips_an_arbitrary_id_set() {
