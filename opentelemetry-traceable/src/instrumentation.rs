@@ -20,7 +20,7 @@
 //!
 //! # How isolation works
 //!
-//! Each `#[traceable]` site carries a `u64` enabled bitmask (one bit per slot).
+//! Each `#[traceable]` site carries an enabled bitmask, one bit per slot.
 //! The macro loads it once per call: `0` means nobody is tracing (the
 //! single-atomic-load fast path), and anything else routes through
 //! [`start_spans`], which builds one child span *per active slot* using that
@@ -58,10 +58,32 @@ use crate::registry::{REGISTRY, TraceSite};
 use crate::selector::{self, Selection, UnknownKeys};
 
 /// Number of [`Instrumentation`]s that can be live simultaneously -- one bit per
-/// slot in each site's `u64` masks. Slots are released on `Drop` and reused, so
+/// slot in each site's mask. Slots are released on `Drop` and reused, so
 /// this bounds concurrent instrumentations, not how many may be created over the
 /// process lifetime.
 pub const MAX_INSTRUMENTATIONS: u32 = 64;
+
+/// The word a set of slots is packed into: one bit per live instrumentation.
+///
+/// This is the *single* place the instrumentation ceiling is decided. Everything
+/// derived from it -- how many bits a mask holds, how wide the slot table is, and
+/// [`MAX_INSTRUMENTATIONS`] itself -- follows from this type, and the assertion
+/// below fails the build if they ever fall out of step. Widening the ceiling means
+/// changing this alias and `MAX_INSTRUMENTATIONS` together; nothing else needs to
+/// be hunted down.
+///
+/// `TraceSite`'s mask fields stay spelled `AtomicU64` because there is no
+/// `Atomic<SlotMask>` to alias, and keeping them concrete is what lets this alias
+/// remain private to this module.
+type SlotMask = u64;
+
+/// How many slots a [`SlotMask`] can hold.
+const SLOT_BITS: usize = SlotMask::BITS as usize;
+
+const _: () = assert!(
+    SLOT_BITS == MAX_INSTRUMENTATIONS as usize,
+    "MAX_INSTRUMENTATIONS must equal the number of bits in SlotMask"
+);
 
 // ---------------------------------------------------------------------------
 // Slot-scoped bit operations backing each `Instrumentation`'s own slot. Each
@@ -70,8 +92,8 @@ pub const MAX_INSTRUMENTATIONS: u32 = 64;
 // ---------------------------------------------------------------------------
 
 #[inline]
-fn bit(slot: u8) -> u64 {
-    1u64 << slot
+fn bit(slot: u8) -> SlotMask {
+    1 << slot
 }
 
 /// How a name/id match updates a slot's bit.
@@ -190,38 +212,96 @@ where
     }
 }
 
-type SlotTable = [Option<Arc<dyn DynTracer>>; MAX_INSTRUMENTATIONS as usize];
-
-/// Lock-free-readable table of the named slots' tracers. Read once per
-/// multi-slot call (a single atomic pointer load); swapped wholesale on the
-/// rare create/drop of an instrumentation.
-static SLOT_TABLE: LazyLock<ArcSwap<SlotTable>> =
-    LazyLock::new(|| ArcSwap::from_pointee(std::array::from_fn(|_| None)));
-
-/// Slot allocator: bump `next` through `0..MAX_INSTRUMENTATIONS` for fresh
-/// slots, then recycle whatever `Drop` has released into `freed`. So the cap is
-/// on *concurrently live* instrumentations, not on how many are created over the
-/// process lifetime -- which matters for hot-reload, where an instrumentation is
-/// torn down and rebuilt every time its identity (tracer/endpoint) changes.
+/// Everything the slot layer owns: which slot holds which tracer, and which slot
+/// numbers are in play.
 ///
-/// Reuse leaves one narrow race. `Drop` clears its bit across many sites
-/// non-atomically, and a `#[traceable]` call reads the site's mask (in the
-/// macro) before reading [`SLOT_TABLE`] (in [`start_spans`]). A thread
-/// descheduled between those two reads, across an entire drop *and* rebuild,
-/// would find the new occupant's tracer behind a bit the old occupant set, and
-/// emit one span into the wrong instrumentation. Closing it properly needs
-/// epoch-based reclamation before a slot is released; the cost of losing the
-/// race is a single mis-attributed span during a reload, which isn't worth that
-/// machinery or the hot-path validation it would add.
-struct SlotAlloc {
+/// These two used to be separate globals -- a tracer table and an allocator behind
+/// its own mutex -- which meant creating an instrumentation was two steps
+/// (take a slot, then publish its tracer) and dropping one was three. Those
+/// intermediate states were observable: a slot could be taken with no tracer
+/// behind it yet. Holding both here means every transition is a single
+/// [`ArcSwap`] publish, so no reader can see a half-finished one.
+///
+/// `next` bumps through `0..MAX_INSTRUMENTATIONS` for fresh slots, then `freed`
+/// is recycled. The cap is therefore on *concurrently live* instrumentations, not
+/// on how many are created over the process lifetime -- which matters for
+/// hot-reload, where an instrumentation is torn down and rebuilt every time its
+/// identity (tracer/endpoint) changes.
+///
+/// Reuse still leaves one narrow race, unchanged by the consolidation and
+/// documented in full at `docs/multi-instrumentation.md`: a `#[traceable]` call
+/// reads the site's mask (in the macro) before reading this table (in
+/// [`start_spans`]), so a thread descheduled between those two reads, across an
+/// entire drop *and* rebuild, can pair the old occupant's enable bit with the new
+/// occupant's tracer and emit one span into the wrong instrumentation. Closing it
+/// requires the mask and the tracer to come from the *same* snapshot, which means
+/// moving the per-site masks in here too; that is deliberately out of scope.
+#[derive(Clone)]
+struct Slots {
+    tracers: [Option<Arc<dyn DynTracer>>; SLOT_BITS],
     next: u8,
     freed: Vec<u8>,
 }
 
-static SLOTS: Mutex<SlotAlloc> = Mutex::new(SlotAlloc {
-    next: 0,
-    freed: Vec::new(),
-});
+impl Slots {
+    fn empty() -> Self {
+        Self {
+            tracers: std::array::from_fn(|_| None),
+            next: 0,
+            freed: Vec::new(),
+        }
+    }
+
+    /// Takes the next free slot, or `None` when [`MAX_INSTRUMENTATIONS`] are live.
+    fn alloc(&mut self) -> Option<u8> {
+        if let Some(slot) = self.freed.pop() {
+            return Some(slot);
+        }
+        if u32::from(self.next) < MAX_INSTRUMENTATIONS {
+            let slot = self.next;
+            self.next += 1;
+            return Some(slot);
+        }
+        None
+    }
+}
+
+/// Lock-free-readable slot state. Read once per multi-slot call (a single atomic
+/// pointer load); swapped wholesale on the rare create/drop of an instrumentation.
+static SLOTS: LazyLock<ArcSwap<Slots>> = LazyLock::new(|| ArcSwap::from_pointee(Slots::empty()));
+
+/// Serializes writers so slot allocation is linearizable. Readers never take it.
+///
+/// This is why mutations don't use [`ArcSwap::rcu`]: `rcu` re-runs its closure when
+/// it loses the swap race, and allocating a slot is not idempotent -- a retry would
+/// hand out a second slot and leak the first. Holding a lock across the
+/// read-modify-publish keeps allocation exactly-once, and costs nothing on the read
+/// path.
+static SLOTS_WRITE: Mutex<()> = Mutex::new(());
+
+/// Read-modify-publish the slot state under [`SLOTS_WRITE`].
+///
+/// `f` runs exactly once, so it may allocate. Poisoning is tolerated rather than
+/// propagated: the guarded data lives in the `ArcSwap`, not in the mutex, so a
+/// writer that panicked mid-publish left the last *published* snapshot intact and
+/// there is nothing to recover.
+fn with_slots(f: impl FnOnce(&mut Slots)) {
+    try_with_slots(|slots| {
+        f(slots);
+        Some(())
+    });
+}
+
+/// As [`with_slots`], but `f` returns `None` to abandon the change and publish
+/// nothing -- so a rejected mutation doesn't swap in an identical snapshot and
+/// make writers wait on readers for no reason.
+fn try_with_slots<R>(f: impl FnOnce(&mut Slots) -> Option<R>) -> Option<R> {
+    let _guard = SLOTS_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut next = (**SLOTS.load()).clone();
+    let out = f(&mut next)?;
+    SLOTS.store(Arc::new(next));
+    Some(out)
+}
 
 // ---------------------------------------------------------------------------
 // The per-call multi-slot state carried inside `Context`.
@@ -232,6 +312,11 @@ static SLOTS: Mutex<SlotAlloc> = Mutex::new(SlotAlloc {
 /// path appear, so cloning it costs the active count, not the slot capacity.
 #[derive(Clone)]
 struct MultiInstrumentState(SmallVec<[(u8, Context); 4]>);
+
+/// The slots that will produce a span on this call: each slot, its tracer cloned
+/// out of the published snapshot, and the parent context to build the span under.
+/// Sized for the same 4 active slots [`MultiInstrumentState`] inlines.
+type ActiveSlots = SmallVec<[(u8, Arc<dyn DynTracer>, Context); 4]>;
 
 fn span_builder(name: &'static str, attrs: &[KeyValue]) -> SpanBuilder {
     if attrs.is_empty() {
@@ -267,26 +352,44 @@ pub fn start_spans(
         .map(|s| s.0.clone())
         .unwrap_or_default();
 
-    let table = SLOT_TABLE.load();
-    let mut created_any = false;
+    // Decide which slots trace this call and copy their tracers out of the
+    // published snapshot, then release the guard *before* any span work happens.
+    // `ArcSwap::swap` waits for outstanding guards, so holding one across span
+    // construction would let a slow sampler or exporter stall
+    // `Instrumentation::build`/`drop` -- i.e. a config reload could block on
+    // exporter latency. arc-swap also has only a small fixed number of fast borrow
+    // slots per thread, which nested traced calls would otherwise exhaust and
+    // silently downgrade. Each slot touches only its own envelope entry, so
+    // deciding them all up front is equivalent to deciding them as we go.
+    let mut active = ActiveSlots::new();
+    {
+        let slots = SLOTS.load();
+        let mut bits = enabled_mask;
+        while bits != 0 {
+            let slot = bits.trailing_zeros() as u8;
+            bits &= bits - 1;
 
-    let mut bits = enabled_mask;
-    while bits != 0 {
-        let slot = bits.trailing_zeros() as u8;
-        bits &= bits - 1;
-
-        let parent = env.iter().find(|(s, _)| *s == slot).map(|(_, c)| c);
-        // Child-only: only trace when this slot already has a recording span on
-        // this call path, so a shared helper never orphans a root span on the
-        // paths that aren't being traced.
-        if child_only_mask & bit(slot) != 0 && !parent.is_some_and(|c| c.span().is_recording()) {
-            continue;
+            let parent = env.iter().find(|(s, _)| *s == slot).map(|(_, c)| c);
+            // Child-only: only trace when this slot already has a recording span on
+            // this call path, so a shared helper never orphans a root span on the
+            // paths that aren't being traced.
+            if child_only_mask & bit(slot) != 0 && !parent.is_some_and(|c| c.span().is_recording())
+            {
+                continue;
+            }
+            match slots.tracers[slot as usize].as_ref() {
+                Some(tracer) => {
+                    let base = parent.cloned().unwrap_or_default();
+                    active.push((slot, Arc::clone(tracer), base));
+                }
+                // Instrumentation was dropped mid-flight; just skip its slot.
+                None => continue,
+            }
         }
-        let Some(tracer) = table[slot as usize].as_ref() else {
-            // Instrumentation was dropped mid-flight; just skip its slot.
-            continue;
-        };
-        let base = parent.cloned().unwrap_or_default();
+    }
+
+    let mut created_any = false;
+    for (slot, tracer, base) in active {
         let child = tracer.start_in(span_builder(span_name, &attrs), &base);
         match env.iter_mut().find(|(s, _)| *s == slot) {
             Some(entry) => entry.1 = child,
@@ -383,27 +486,15 @@ impl InstrumentationBuilder {
             .tracer
             .expect("InstrumentationBuilder::build requires a tracer");
 
-        let mut slots = SLOTS
-            .lock()
-            .expect("opentelemetry-traceable slot allocator poisoned");
-        let slot = if let Some(slot) = slots.freed.pop() {
-            slot
-        } else if u32::from(slots.next) < MAX_INSTRUMENTATIONS {
-            let slot = slots.next;
-            slots.next += 1;
-            slot
-        } else {
-            return Err(SlotsExhausted);
-        };
-        drop(slots);
-
-        // Publish the tracer before returning the handle, so any later
-        // `enable` on this slot is guaranteed to find it.
-        SLOT_TABLE.rcu(|old| {
-            let mut new: SlotTable = std::array::from_fn(|i| (**old)[i].clone());
-            new[slot as usize] = Some(tracer.clone());
-            new
-        });
+        // One publish: the slot is taken and its tracer installed together, so no
+        // reader ever sees a slot claimed with nothing behind it. Any later
+        // `enable` on this slot is therefore guaranteed to find the tracer.
+        let slot = try_with_slots(|slots| {
+            let slot = slots.alloc()?;
+            slots.tracers[slot as usize] = Some(tracer);
+            Some(slot)
+        })
+        .ok_or(SlotsExhausted)?;
 
         Ok(Instrumentation { slot })
     }
@@ -512,18 +603,13 @@ impl Drop for Instrumentation {
             site.enabled_mask.fetch_and(!b, Ordering::Relaxed);
             site.child_only_mask.fetch_and(!b, Ordering::Relaxed);
         }
+        // One publish: the tracer is removed and the slot released together. The
+        // slot cannot be handed out while its tracer is still reachable, so the
+        // next occupant can't be reached through this one's leftovers.
         let slot = self.slot;
-        SLOT_TABLE.rcu(|old| {
-            let mut new: SlotTable = std::array::from_fn(|i| (**old)[i].clone());
-            new[slot as usize] = None;
-            new
+        with_slots(|slots| {
+            slots.tracers[slot as usize] = None;
+            slots.freed.push(slot);
         });
-        // Release the slot only after its bits are clear and its tracer is gone,
-        // so the next occupant can't be reached through this one's leftovers.
-        SLOTS
-            .lock()
-            .expect("opentelemetry-traceable slot allocator poisoned")
-            .freed
-            .push(slot);
     }
 }

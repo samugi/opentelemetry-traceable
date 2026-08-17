@@ -377,13 +377,24 @@ without a single benchmark moving.
 - `opentelemetry-traceable/src/registry.rs` — `TraceSite` masks, the `REGISTRY` slice, and
   `keys()`, the sorted deduplicated discovery list.
 - `opentelemetry-traceable/src/instrumentation.rs` — `Instrumentation`, `InstrumentationBuilder`,
-  constants, `ArcSwap` slot table, free-list allocator, shared bit-op helpers,
-  `DynTracer`, `MultiInstrumentState`, `start_spans`.
+  constants, `SlotMask`/`SLOT_BITS` (the one place the instrumentation ceiling is
+  decided, with a `const` assertion tying it to `MAX_INSTRUMENTATIONS`), the
+  `ArcSwap<Slots>` snapshot holding both the tracer table and the free-list
+  allocator, shared bit-op helpers, `DynTracer`, `MultiInstrumentState`,
+  `start_spans`.
 - `opentelemetry-traceable/src/selector.rs` — `matches` / `is_glob` / `resolve`, plus
   `Selection` and `UnknownKeys`.
 - `opentelemetry-traceable-macros/src/lib.rs` — two-way `expand()` dispatch.
 - `opentelemetry-traceable/tests/traceable.rs` — isolation/nesting/coexistence/child-only/drop
-  tests, slot-reuse churn, and the in-process-only assertions.
+  tests, slot-reuse churn, dynamic-reconfiguration coverage (repeated reconfigure,
+  concurrent reconfigure from two threads, rebuild-under-load), and the
+  in-process-only assertions.
 - `opentelemetry-traceable/tests/selector.rs` — glob-matching table, and `resolve` against the
   test binary's own registry (unknown-key errors, unmatched globs).
-- `opentelemetry-traceable/benches/traceable_overhead.rs` — per-instrumentation-count cases.
+- `opentelemetry-traceable/benches/traceable_overhead.rs` — per-instrumentation-count cases,
+  plus `light_{one_site,many_sites}_{disa,enab}`: 64 distinct sites dispatched
+  round-robin under a deliberately tiny body. The headline cases call one function
+  in a tight loop, so that site's registry entry never leaves L1 and they cannot
+  detect *per-site* memory cost; these can. Note the harness's run-to-run noise on
+  a laptop is around ±8% — `no_macro` alone varies that much between runs — so
+  small deltas here need repeated runs before they mean anything.

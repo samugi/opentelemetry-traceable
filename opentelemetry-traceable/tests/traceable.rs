@@ -302,6 +302,133 @@ fn enabled_names_reflects_the_active_subset() {
     assert_eq!(enabled(&instr), ["nesting::child", "nesting::parent"]);
 }
 
+// A site's enabled state is the *union* across instrumentations, and each one
+// owns exactly its own bit. Pinned explicitly because it is the invariant any
+// future consolidation of the per-site masks has to preserve: a derived
+// "is anyone tracing this site" summary must stay set while *any* instrumentation
+// still wants the site, and must not be clobbered by another one disabling it.
+#[test]
+fn one_instrumentation_disabling_a_site_leaves_the_others_alone() {
+    let (a, exporter_a) = instr("A");
+    let (b, exporter_b) = instr("B");
+
+    a.enable(&["nesting::child"]).unwrap();
+    b.enable(&["nesting::child"]).unwrap();
+    assert_eq!(enabled(&a), ["nesting::child"]);
+    assert_eq!(enabled(&b), ["nesting::child"]);
+
+    a.disable(&["nesting::child"]).unwrap();
+
+    assert!(
+        enabled(&a).is_empty(),
+        "A disabled it, so A must see nothing"
+    );
+    assert_eq!(
+        enabled(&b),
+        ["nesting::child"],
+        "B never disabled it, so B must be untouched"
+    );
+
+    child();
+    assert!(
+        exporter_a.get_finished_spans().unwrap().is_empty(),
+        "A must collect no span after disabling"
+    );
+    assert_eq!(
+        exporter_b.get_finished_spans().unwrap().len(),
+        1,
+        "B must still collect its span"
+    );
+}
+
+// --- Dynamic reconfiguration -------------------------------------------------
+// Hot-reload drives these paths on every `config.yaml` save, so they get explicit
+// coverage: repeated reconfiguration must not accumulate stale state, concurrent
+// reconfiguration must not lose an update, and rebuilding an instrumentation while
+// traced functions are running must stay consistent.
+
+#[test]
+fn repeated_reconfiguration_leaves_no_stale_state() {
+    let (instr, exporter) = instr("A");
+
+    for _ in 0..50 {
+        instr.set_enabled(&["nesting::parent"]).unwrap();
+        assert_eq!(enabled(&instr), ["nesting::parent"]);
+
+        instr.set_enabled(&["nesting::child"]).unwrap();
+        assert_eq!(enabled(&instr), ["nesting::child"]);
+
+        instr.set_enabled::<&str>(&[]).unwrap();
+        assert!(enabled(&instr).is_empty());
+    }
+
+    // Nothing traced during the loop, so the final state alone decides what runs.
+    instr.set_enabled(&["nesting::child"]).unwrap();
+    parent();
+
+    let spans = exporter.get_finished_spans().unwrap();
+    assert_eq!(spans.len(), 1, "only the last configuration should apply");
+    assert_eq!(spans[0].name, "nesting::child");
+}
+
+#[test]
+fn concurrent_reconfiguration_of_two_instrumentations_loses_nothing() {
+    let (a, _exporter_a) = instr("A");
+    let (b, _exporter_b) = instr("B");
+
+    // Each instrumentation owns its own bit, so hammering both at once must leave
+    // both final states intact rather than one clobbering the other.
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            for _ in 0..200 {
+                a.set_enabled(&["nesting::parent"]).unwrap();
+            }
+        });
+        scope.spawn(|| {
+            for _ in 0..200 {
+                b.set_enabled(&["nesting::child"]).unwrap();
+            }
+        });
+    });
+
+    assert_eq!(enabled(&a), ["nesting::parent"]);
+    assert_eq!(enabled(&b), ["nesting::child"]);
+}
+
+#[test]
+fn rebuilding_an_instrumentation_under_load_stays_consistent() {
+    // Identity changes in `config.yaml` tear an instrumentation down and build a
+    // fresh one, recycling its slot -- while traced functions keep running. Each
+    // generation must only ever collect spans for keys it actually enabled.
+    let stop = std::sync::atomic::AtomicBool::new(false);
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                parent();
+            }
+        });
+
+        for _ in 0..50 {
+            let (instr, exporter) = instr("churn");
+            instr
+                .enable(&["nesting::parent", "nesting::child"])
+                .unwrap();
+            parent();
+            for span in exporter.get_finished_spans().unwrap() {
+                assert!(
+                    span.name == "nesting::parent" || span.name == "nesting::child",
+                    "collected a span for a key this instrumentation never enabled: {}",
+                    span.name
+                );
+            }
+            drop(instr);
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
 #[test]
 fn set_enabled_toggles_spans_by_key() {
     let (instr, exporter) = instr("A");
