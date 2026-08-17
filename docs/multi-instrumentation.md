@@ -107,9 +107,11 @@ returned `Context` via `with_span`.
 ### 4. `Instrumentation` handle + slot allocator
 
 `Instrumentation::builder().name(..).tracer(some_tracer).build()` allocates a
-slot and registers the tracer. The handle exposes the encoded-subset API scoped
-to its slot: `enable_all`, `disable_all`, `set_enabled_encoded`,
-`enable_encoded`, `disable_encoded`, `set_child_only_encoded`, plus
+slot and registers the tracer. The handle exposes the selector API scoped to its
+slot: `enable_all`, `disable_all`, `set_enabled`, `enable`, `disable`,
+`set_child_only` — each taking a list of registry keys and/or `*` globs and
+returning `Result<Selection, UnknownKeys>` (see
+[Selecting trace sites by name](#selecting-trace-sites-by-name)) — plus
 `enabled_names`/`child_only_names` for read-only introspection.
 
 - **Slot allocation: bump `0..64`, then recycle a free list.** `Drop` releases
@@ -249,52 +251,139 @@ got *faster*, because `start_spans` shed the slot-0 branch and the
 skip the envelope. Trading ~3% on one path for the deletion of an entire special
 case — and for a uniform mental model — was judged worth it.
 
-## Stable trace-site ids
+## Selecting trace sites by name
 
-Ids were originally a site's position in the `linkme`-collected `REGISTRY`. That
-turned out to be unusable: `linkme` guarantees no ordering, and in practice the
-order shifted on almost any rebuild — editing a file containing no `#[traceable]`
-function at all was enough, and debug and release never agreed with each other.
-Since a stale encoded value still decodes (out-of-range ids are skipped,
-in-range ones resolve to whatever now sits at that index), every such rebuild
-silently retargeted tracing with no error anywhere.
+A site's registry key — `module_path!() + "::" + fn_name`, or the string in
+`#[traceable(name = "...")]` — **is** its identity. There is no id, index, or
+encoded form: configuration writes down the functions it wants, the way DTrace
+names probes, over a probe set that happens to be declared at compile time.
+`registry::keys()` is the sorted, deduplicated list of what a given binary
+offers; it exists purely for discovery, and a position in it means nothing.
 
-An id is now an index into the **sorted set of registry keys**
-(`registry::names_by_id`). That depends on nothing but the keys themselves, so it
-is invariant under rebuilds, edits anywhere in the source, moving functions
-within a file, and the build profile.
+`selector::resolve(selectors: &[S]) -> Result<Selection, UnknownKeys>` matches a
+list of keys and/or globs against that list, and the `Instrumentation` setters are
+thin wrappers over it (`set_enabled`, `enable`, `disable`, `set_child_only`).
+Because resolution is separate from application, it doubles as the dry-run entry
+point: resolve first to see what a glob would select before touching a bit.
+Selectors are trimmed and blank ones ignored, so an empty list is simply a
+selection of nothing — and since a `set_*` is a replace, that clears every bit
+without needing an "empty means all off" special case.
 
-Two alternatives were rejected:
+### One wildcard: `*`
+
+`*` matches any run of characters, **including `::`**, and it is the only
+wildcard — there is deliberately no `**`. How deeply a function is nested is an
+implementation detail of the code being traced, not something the operator
+selecting it should have to track:
+
+```text
+my_app::domain::db::*   matches      my_app::domain::db::query
+                        matches      my_app::domain::db::pool::acquire
+                        does NOT match  my_app::domain::db   (nothing after `::`)
+*::db::*                matches      any db function, in any crate or module
+*                       matches      everything — the config-file `enable_all()`
+```
+
+In the demo, whose binary carries 73 `#[traceable]` keys, `...::domain::db::*`
+selects exactly 21 of them: one line where the id scheme wanted twenty-one
+numbers looked up in a catalog dump.
+
+### Typos are errors, empty globs are warnings
+
+The two ways a selector can match nothing are not the same mistake, so they are
+reported differently:
+
+- An **exact** selector matching nothing is almost certainly a typo, so `resolve`
+  returns `Err(UnknownKeys)` — listing *every* offender, not just the first — and
+  **nothing is applied**. Resolution runs to completion before any bit is
+  touched, so the instrumentation keeps whatever set it had. Tracing an unnoticed
+  subset of what was asked for is worse than refusing.
+- A **glob** matching nothing comes back in `Ok(Selection::unmatched_globs)` as a
+  warning, since a glob can legitimately match nothing in a build where those
+  functions were compiled out (a feature flag, a different binary in the
+  workspace).
+
+If both happen in one call, the error wins and nothing is applied.
+
+### Consequence: sites can share a key
+
+Sites sharing a registry key — two methods with the same name in one module,
+absent a `name` override, since a key is *not* qualified by the surrounding
+`impl` type — share one key and toggle together. That is deliberate: naming is
+the identity, so two things with the same name are one selectable thing. Give one
+of them `#[traceable(name = "...")]` to separate them.
+
+### History: the ids this replaced
+
+Selection went through two id schemes before landing on keys, and both are worth
+recording because they failed the same way.
+
+Ids were originally a site's **position in the `linkme`-collected `REGISTRY`**.
+That turned out to be unusable: `linkme` guarantees no ordering, and in practice
+the order shifted on almost any rebuild — editing a file containing no
+`#[traceable]` function at all was enough, and debug and release never agreed
+with each other. Since a stale encoded value still decoded (out-of-range ids
+skipped, in-range ones resolving to whatever now sat at that index), every such
+rebuild silently retargeted tracing with no error anywhere.
+
+Ids then became an index into the **sorted set of registry keys**
+(`registry::names_by_id`), which depends on nothing but the keys themselves and
+so was invariant under rebuilds, edits anywhere in the source, moving functions
+within a file, and the build profile. Two alternatives were rejected at that
+point, and the reasoning stands as a record of what a stable id costs:
 
 - **Hashing each key into a build-independent `u64`.** Stable, but it scatters
-  ids across the whole range, and the codec's compactness comes from delta-encoding
-  a *dense* index — every encoded string would balloon.
-- **Sorting by `(name, file, line)`.** Was implemented briefly, using `file!()`/
-  `line!()` from the macro to break ties between sites sharing a key. Rejected: it
-  reintroduces a source-location dependency, so two same-key sites in one file
-  swap ids when reordered. Sorting keys alone removes the tie-break entirely.
+  ids across the whole range, and the codec's compactness came from
+  delta-encoding a *dense* index — every encoded string would balloon.
+- **Sorting by `(name, file, line)`.** Implemented briefly, using `file!()`/
+  `line!()` from the macro to break ties between sites sharing a key. Rejected:
+  it reintroduces a source-location dependency, so two same-key sites in one file
+  swap ids when reordered. Sorting keys alone removed the tie-break entirely.
 
-Consequences worth noting:
+What finally killed ids is that sorted-key ids were only stable against
+*rebuilds*, never against *edits*. Adding or removing a single `#[traceable]`
+function renumbered every id after it alphabetically — and the failure was
+**silent**, in exactly the way the `linkme` ordering had been: a stale
+configuration string still decoded to perfectly valid ids that now pointed at the
+wrong functions. A dense index cannot avoid this; it is the index. So the scheme
+whose whole purpose was to survive a rebuild still could not survive someone
+adding a traced function, which is the single most likely edit in a codebase
+using this library.
 
-- Sites sharing a registry key (two methods with the same name in one module,
-  absent a `name` override) now share one id and toggle together. Previously they
-  had distinct ids that nothing could tell apart. `apply_encoded` walks a grouped
-  view so one id flips every site carrying that key.
-- Sorting by key clusters a module's functions onto consecutive ids, so
-  module-shaped subsets encode smaller than before.
-- Adding or removing a key still renumbers the ids after it. That's inherent to a
-  dense index and is the only case that requires re-encoding.
+And the compactness it bought was being paid for in the one place it mattered
+least. There is no header, no baggage, and no per-request transport anywhere in
+this design — an instrumentation's configuration is a file that a human, or an
+LLM on a human's behalf, edits and reviews. Trading legibility for bytes in a
+hand-edited config file is the wrong trade: `my_app::domain::db::query` is longer
+than an id and it is also greppable, diffable, reviewable in a pull request, and
+wrong out loud when it's wrong. Keys need no catalog to interpret, no re-encoding
+after an edit, and — with `*` — express a module-shaped or concern-shaped subset
+more compactly than the delta encoding ever did.
+
+Removing the scheme also removed `codec` (base64 + LEB128 delta encoding),
+`catalog` (the name→id mapping and its JSON dump), `registry::names_by_id` /
+`sites_by_id` / `groups`, and with them the `base64`, `leb128`, `serde` and
+`serde_json` dependencies — four fewer, none added. `groups()` had also been
+O(keys × sites), re-filtering all of `REGISTRY` once per key; `keys()` is a
+single sorted, deduplicated pass.
+
+None of this touched the hot path. The macro captures a direct
+`&'static TraceSite`, so tracing never consults a name, a key, or an id — the id
+scheme was only ever a config-format concern, which is why it could be replaced
+without a single benchmark moving.
 
 ## Files
 
-- `opentelemetry-traceable/src/registry.rs` — `TraceSite` masks, and the sorted-key id ordering
-  (`names_by_id` / `name_by_id` / `id_of_name`).
+- `opentelemetry-traceable/src/registry.rs` — `TraceSite` masks, the `REGISTRY` slice, and
+  `keys()`, the sorted deduplicated discovery list.
 - `opentelemetry-traceable/src/instrumentation.rs` — `Instrumentation`, `InstrumentationBuilder`,
   constants, `ArcSwap` slot table, free-list allocator, shared bit-op helpers,
   `DynTracer`, `MultiInstrumentState`, `start_spans`.
-- `opentelemetry-traceable/src/catalog.rs` — the `{name, id}` node dump, plus `all_names`.
-- `opentelemetry-traceable/src/codec.rs` — `encode`/`decode`/`DecodeError` for subset strings.
+- `opentelemetry-traceable/src/selector.rs` — `matches` / `is_glob` / `resolve`, plus
+  `Selection` and `UnknownKeys`.
 - `opentelemetry-traceable-macros/src/lib.rs` — two-way `expand()` dispatch.
 - `opentelemetry-traceable/tests/traceable.rs` — isolation/nesting/coexistence/child-only/drop
   tests, slot-reuse churn, and the in-process-only assertions.
+- `opentelemetry-traceable/tests/selector.rs` — glob-matching table, and `resolve` against the
+  test binary's own registry (unknown-key errors, unmatched globs).
 - `opentelemetry-traceable/benches/traceable_overhead.rs` — per-instrumentation-count cases.

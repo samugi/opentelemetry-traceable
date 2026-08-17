@@ -9,13 +9,12 @@
 //! or default instrumentation and no process-wide tracer. Each one carries its
 //! own [`opentelemetry::trace::Tracer`], its own enabled subset, and its own
 //! isolated span hierarchy over the same call flow, so several can run in
-//! parallel over the same functions. Subsets are applied as compact,
-//! [`codec`]-encoded trace-site id lists.
+//! parallel over the same functions. A subset is applied by naming the functions
+//! it contains -- their registry keys, or `*` globs over them; see [`selector`].
 
-pub mod catalog;
-pub mod codec;
 pub mod instrumentation;
 pub mod registry;
+pub mod selector;
 
 pub use opentelemetry_traceable_macros::traceable;
 

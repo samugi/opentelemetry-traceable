@@ -1,5 +1,4 @@
-//! Link-time-collected registry of every `#[traceable]` call site, and the
-//! stable id ordering derived from it.
+//! Link-time-collected registry of every `#[traceable]` call site.
 
 use std::sync::LazyLock;
 use std::sync::atomic::AtomicU64;
@@ -7,17 +6,17 @@ use std::sync::atomic::AtomicU64;
 /// One entry per `#[traceable]` function, contributed by the macro at the
 /// call site and collected here via `linkme` before `main()` runs.
 ///
-/// A trace site's **id** (used by [`crate::codec`] to encode a subset, and
-/// reported by [`crate::catalog`]) is derived from its [`name`](Self::name)
-/// alone -- see [`names_by_id`].
+/// A trace site is identified by its [`name`](Self::name) -- that key is what
+/// configuration selects, exactly or by glob (see [`crate::selector`]). There is
+/// no id or index: nothing here is addressed by position.
 #[derive(Debug)]
 pub struct TraceSite {
     /// The registry key used to enable/disable this function. Defaults to
     /// `module_path!() + "::" + fn_name`, or the macro's `name` argument.
     ///
-    /// This is the *only* thing a site's id depends on. Note the key isn't
+    /// This is the *whole* identity of a trace site. Note the key isn't
     /// qualified by a surrounding `impl` type, so two methods with the same name
-    /// in the same module share a key -- and therefore an id, toggling together.
+    /// in the same module share a key, and therefore toggle together.
     pub name: &'static str,
 
     /// Bitmask of which instrumentation slots currently have this function
@@ -52,55 +51,28 @@ impl TraceSite {
 /// Every `#[traceable]` function linked into the current binary, in whatever
 /// order the linker produced.
 ///
-/// **Don't use a position in here as an id.** `linkme` gives no ordering
-/// guarantee, and in practice the order changes between builds -- editing an
-/// unrelated file is enough to shuffle it. Ids come from [`names_by_id`].
+/// **A position in here means nothing.** `linkme` gives no ordering guarantee,
+/// and in practice the order changes between builds -- editing an unrelated file
+/// is enough to shuffle it. Iterate it to find sites; identify them by
+/// [`name`](TraceSite::name), never by index. [`keys`] is the sorted view.
 #[linkme::distributed_slice]
 pub static REGISTRY: [TraceSite] = [..];
 
-/// The distinct registry keys in this binary, sorted. **A key's id is its index
-/// here.**
+/// Every distinct registry key linked into this binary, sorted and deduplicated.
 ///
-/// Deriving ids from the sorted set of keys is what makes them stable: an id
-/// depends on nothing but the keys themselves, so it survives rebuilds, edits
-/// anywhere in the source, moving functions around, and differing profiles
-/// (debug vs release) alike.
+/// This is a *discovery* list, not an identity mapping: a key's position here
+/// means nothing, and nothing is selected by index. A key is selected by writing
+/// it -- exactly, or via a `*` glob -- see [`crate::selector`].
 ///
-/// Ids stay dense `0..n`, so [`crate::codec`]'s delta encoding stays compact --
-/// the alternative, hashing each key into a build-independent id, would have
-/// scattered ids across `u64` and bloated every encoded string. Sorting by key
-/// also clusters related functions (a module's functions land on consecutive
-/// ids), which makes a module-shaped subset encode especially small.
-///
-/// Adding or removing a `#[traceable]` *key* renumbers the ids after it, since
-/// that genuinely changes the set being indexed. That's the only thing that
-/// requires re-encoding.
-pub fn names_by_id() -> &'static [&'static str] {
-    &groups().0
-}
-
-/// Every trace site paired with its id, grouped so that sites sharing a key
-/// share an id and are always toggled together.
-///
-/// Used by [`crate::instrumentation`] to apply a decoded id set: it walks this
-/// once, so a key with two call sites flips both bits.
-pub(crate) fn sites_by_id() -> &'static [Vec<&'static TraceSite>] {
-    &groups().1
-}
-
-/// The sorted distinct keys and, positionally aligned with them, the sites
-/// carrying each key. Built once; the registry is fixed at link time.
-fn groups() -> &'static (Vec<&'static str>, Vec<Vec<&'static TraceSite>>) {
-    static GROUPS: LazyLock<(Vec<&'static str>, Vec<Vec<&'static TraceSite>>)> =
-        LazyLock::new(|| {
-            let mut names: Vec<&'static str> = REGISTRY.iter().map(|site| site.name).collect();
-            names.sort_unstable();
-            names.dedup();
-            let sites = names
-                .iter()
-                .map(|name| REGISTRY.iter().filter(|s| s.name == *name).collect())
-                .collect();
-            (names, sites)
-        });
-    &GROUPS
+/// Sorted so that anything derived from it -- listings, discovery output -- is
+/// reproducible run to run rather than inheriting the linker's `REGISTRY` order.
+/// Built once; the registry is fixed at link time.
+pub fn keys() -> &'static [&'static str] {
+    static KEYS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+        let mut keys: Vec<&'static str> = REGISTRY.iter().map(|site| site.name).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    });
+    &KEYS
 }

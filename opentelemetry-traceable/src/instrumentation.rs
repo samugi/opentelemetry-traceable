@@ -14,7 +14,7 @@
 //!     .tracer(provider.tracer("checkout-debug"))
 //!     .build()
 //!     .expect("a free instrumentation slot");
-//! checkout.enable_encoded(&encoded)?;
+//! checkout.enable(&["my_crate::checkout::*"])?;
 //! // ... dropping `checkout` stops new spans for it and frees its slot for reuse.
 //! ```
 //!
@@ -46,7 +46,6 @@
 //! An instrumentation's spans nest only under other `#[traceable]` spans of
 //! that same instrumentation.
 
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -55,8 +54,8 @@ use opentelemetry::trace::{SpanBuilder, TraceContextExt, Tracer};
 use opentelemetry::{Context, KeyValue};
 use smallvec::SmallVec;
 
-use crate::codec::{self, DecodeError};
-use crate::registry::{self, REGISTRY, TraceSite};
+use crate::registry::{REGISTRY, TraceSite};
+use crate::selector::{self, Selection, UnknownKeys};
 
 /// Number of [`Instrumentation`]s that can be live simultaneously -- one bit per
 /// slot in each site's `u64` masks. Slots are released on `Drop` and reused, so
@@ -86,33 +85,27 @@ enum BitOp {
     Remove,
 }
 
-fn apply_encoded(
-    encoded: &str,
-    field: impl Fn(&TraceSite) -> &AtomicU64,
-    slot: u8,
-    op: BitOp,
-) -> Result<(), DecodeError> {
-    // Decoded ids index the sorted set of registry keys (see
-    // `registry::names_by_id`), never a raw `REGISTRY` position; membership is a
-    // direct positional lookup -- no hashing, no false positives. Iterating the
-    // grouped view means a key shared by two call sites flips both.
-    let wanted: HashSet<u64> = codec::decode(encoded)?.into_iter().collect();
+/// Applies an already-resolved [`Selection`], so this can't fail: resolution --
+/// the only fallible half -- happened before any bit was touched, which is what
+/// makes a typo leave tracing state completely untouched.
+fn apply(selection: &Selection, field: impl Fn(&TraceSite) -> &AtomicU64, slot: u8, op: BitOp) {
     let b = bit(slot);
-    for (id, sites) in registry::sites_by_id().iter().enumerate() {
-        let hit_wanted = wanted.contains(&(id as u64));
-        for site in sites {
-            match (op, hit_wanted) {
-                (BitOp::Replace | BitOp::Add, true) => {
-                    field(site).fetch_or(b, Ordering::Relaxed);
-                }
-                (BitOp::Replace, false) | (BitOp::Remove, true) => {
-                    field(site).fetch_and(!b, Ordering::Relaxed);
-                }
-                (BitOp::Add, false) | (BitOp::Remove, false) => {}
+    // One flat walk over the registry, matching on the key string. Two call sites
+    // sharing a key both match it, so a key with several sites toggles all of them
+    // for free -- there's no grouped view to keep aligned. `selection.keys` is
+    // sorted, so membership is a binary search.
+    for site in REGISTRY.iter() {
+        let hit = selection.keys.binary_search(&site.name).is_ok();
+        match (op, hit) {
+            (BitOp::Replace | BitOp::Add, true) => {
+                field(site).fetch_or(b, Ordering::Relaxed);
             }
+            (BitOp::Replace, false) | (BitOp::Remove, true) => {
+                field(site).fetch_and(!b, Ordering::Relaxed);
+            }
+            (BitOp::Add, false) | (BitOp::Remove, false) => {}
         }
     }
-    Ok(())
 }
 
 pub(crate) fn slot_enable_all(slot: u8) {
@@ -129,49 +122,48 @@ pub(crate) fn slot_disable_all(slot: u8) {
     }
 }
 
-pub(crate) fn slot_set_enabled_encoded(encoded: &str, slot: u8) -> Result<(), DecodeError> {
-    apply_encoded(encoded, |s| &s.enabled_mask, slot, BitOp::Replace)
+pub(crate) fn slot_set_enabled(selection: &Selection, slot: u8) {
+    apply(selection, |s| &s.enabled_mask, slot, BitOp::Replace);
 }
 
-pub(crate) fn slot_enable_encoded(encoded: &str, slot: u8) -> Result<(), DecodeError> {
-    apply_encoded(encoded, |s| &s.enabled_mask, slot, BitOp::Add)
+pub(crate) fn slot_enable(selection: &Selection, slot: u8) {
+    apply(selection, |s| &s.enabled_mask, slot, BitOp::Add);
 }
 
-pub(crate) fn slot_disable_encoded(encoded: &str, slot: u8) -> Result<(), DecodeError> {
-    apply_encoded(encoded, |s| &s.enabled_mask, slot, BitOp::Remove)
+pub(crate) fn slot_disable(selection: &Selection, slot: u8) {
+    apply(selection, |s| &s.enabled_mask, slot, BitOp::Remove);
 }
 
-// Both name listings walk the stable id order, so what they yield is ordered by
-// id (and thus reproducible) rather than by whatever order the linker chose.
-// One key yields one name even when several call sites carry it.
-pub(crate) fn slot_enabled_names(slot: u8) -> impl Iterator<Item = &'static str> {
+pub(crate) fn slot_set_child_only(selection: &Selection, slot: u8) {
+    apply(selection, |s| &s.child_only_mask, slot, BitOp::Replace);
+}
+
+/// The keys whose `field` mask has `slot`'s bit set.
+///
+/// Sorted and deduped explicitly. There's no id order left to inherit, so without
+/// this the linker's arbitrary `REGISTRY` order would leak into what callers see;
+/// dedup because one key can carry several call sites but is one selectable thing.
+fn slot_names(
+    slot: u8,
+    field: impl Fn(&TraceSite) -> &AtomicU64,
+) -> impl Iterator<Item = &'static str> {
     let b = bit(slot);
-    registry::names_by_id()
+    let mut names: Vec<&'static str> = REGISTRY
         .iter()
-        .zip(registry::sites_by_id())
-        .filter(move |(_, sites)| {
-            sites
-                .iter()
-                .any(|s| s.enabled_mask.load(Ordering::Relaxed) & b != 0)
-        })
-        .map(|(name, _)| *name)
+        .filter(|site| field(site).load(Ordering::Relaxed) & b != 0)
+        .map(|site| site.name)
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names.into_iter()
 }
 
-pub(crate) fn slot_set_child_only_encoded(encoded: &str, slot: u8) -> Result<(), DecodeError> {
-    apply_encoded(encoded, |s| &s.child_only_mask, slot, BitOp::Replace)
+pub(crate) fn slot_enabled_names(slot: u8) -> impl Iterator<Item = &'static str> {
+    slot_names(slot, |s| &s.enabled_mask)
 }
 
 pub(crate) fn slot_child_only_names(slot: u8) -> impl Iterator<Item = &'static str> {
-    let b = bit(slot);
-    registry::names_by_id()
-        .iter()
-        .zip(registry::sites_by_id())
-        .filter(move |(_, sites)| {
-            sites
-                .iter()
-                .any(|s| s.child_only_mask.load(Ordering::Relaxed) & b != 0)
-        })
-        .map(|(name, _)| *name)
+    slot_names(slot, |s| &s.child_only_mask)
 }
 
 // ---------------------------------------------------------------------------
@@ -434,37 +426,70 @@ impl Instrumentation {
         slot_disable_all(self.slot);
     }
 
-    /// Replace this instrumentation's enabled set from a compact id list
-    /// produced by [`crate::codec::encode`]: exactly the decoded ids are
-    /// enabled for it, everything else is disabled.
-    pub fn set_enabled_encoded(&self, encoded: &str) -> Result<(), DecodeError> {
-        slot_set_enabled_encoded(encoded, self.slot)
+    /// Replace this instrumentation's enabled set: exactly what `selectors`
+    /// resolves to is enabled for it, everything else disabled.
+    ///
+    /// `selectors` are registry keys, `*` globs, or a mix -- see
+    /// [`crate::selector`] for the matching rules. An empty list disables
+    /// everything, the same as [`disable_all`](Self::disable_all). The returned
+    /// [`Selection`] is what actually matched, including any globs that matched
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`UnknownKeys`] if an exact selector names no `#[traceable]` function. In
+    /// that case **nothing is applied** and this instrumentation keeps whatever
+    /// set it already had, so a typo can't silently trace a subset of what was
+    /// asked for.
+    pub fn set_enabled<S: AsRef<str>>(&self, selectors: &[S]) -> Result<Selection, UnknownKeys> {
+        let selection = selector::resolve(selectors)?;
+        slot_set_enabled(&selection, self.slot);
+        Ok(selection)
     }
 
-    /// Enable whatever's in the encoded id list (additive).
-    pub fn enable_encoded(&self, encoded: &str) -> Result<(), DecodeError> {
-        slot_enable_encoded(encoded, self.slot)
+    /// Enable whatever `selectors` resolves to, leaving the rest of the enabled
+    /// set alone (additive).
+    ///
+    /// # Errors
+    ///
+    /// As [`set_enabled`](Self::set_enabled).
+    pub fn enable<S: AsRef<str>>(&self, selectors: &[S]) -> Result<Selection, UnknownKeys> {
+        let selection = selector::resolve(selectors)?;
+        slot_enable(&selection, self.slot);
+        Ok(selection)
     }
 
-    /// Disable whatever's in the encoded id list.
-    pub fn disable_encoded(&self, encoded: &str) -> Result<(), DecodeError> {
-        slot_disable_encoded(encoded, self.slot)
+    /// Disable whatever `selectors` resolves to, leaving the rest of the enabled
+    /// set alone.
+    ///
+    /// # Errors
+    ///
+    /// As [`set_enabled`](Self::set_enabled).
+    pub fn disable<S: AsRef<str>>(&self, selectors: &[S]) -> Result<Selection, UnknownKeys> {
+        let selection = selector::resolve(selectors)?;
+        slot_disable(&selection, self.slot);
+        Ok(selection)
     }
 
-    /// Replace this instrumentation's *child-only* set from a compact id list
-    /// produced by [`crate::codec::encode`]: exactly the decoded ids are put in
-    /// child-only mode for it, every other function is made root-capable again.
+    /// Replace this instrumentation's *child-only* set: exactly what `selectors`
+    /// resolves to is put in child-only mode for it, every other function made
+    /// root-capable again.
     ///
     /// A child-only function only produces a span when this instrumentation
     /// already has a recording span on the current call path -- never as a root,
     /// even when enabled. This is orthogonal to
-    /// [`set_enabled_encoded`](Self::set_enabled_encoded): a function must be
-    /// enabled to trace at all, and being child-only additionally suppresses it
-    /// when it would otherwise be a root. Whether a shared function should be
-    /// child-only is request-relative, so it's decided here rather than at the
-    /// call site.
-    pub fn set_child_only_encoded(&self, encoded: &str) -> Result<(), DecodeError> {
-        slot_set_child_only_encoded(encoded, self.slot)
+    /// [`set_enabled`](Self::set_enabled): a function must be enabled to trace at
+    /// all, and being child-only additionally suppresses it when it would
+    /// otherwise be a root. Whether a shared function should be child-only is
+    /// request-relative, so it's decided here rather than at the call site.
+    ///
+    /// # Errors
+    ///
+    /// As [`set_enabled`](Self::set_enabled).
+    pub fn set_child_only<S: AsRef<str>>(&self, selectors: &[S]) -> Result<Selection, UnknownKeys> {
+        let selection = selector::resolve(selectors)?;
+        slot_set_child_only(&selection, self.slot);
+        Ok(selection)
     }
 
     /// Registry keys currently enabled for this instrumentation.

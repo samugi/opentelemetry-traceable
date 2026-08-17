@@ -4,15 +4,11 @@ version = { workspace = true }
 edition = { workspace = true }
 
 [dependencies]
-base64 = { workspace = true }
-leb128 = { workspace = true }
 linkme = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-traceable-macros = { path = "../opentelemetry-traceable-macros", version = "0.1.0" }
 arc-swap = { workspace = true }
 smallvec = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 
 [dev-dependencies]
 opentelemetry_sdk = { workspace = true }

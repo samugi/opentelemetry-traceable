@@ -34,23 +34,10 @@ fn instr(name: &'static str) -> (Instrumentation, InMemorySpanExporter) {
     (instr, exporter)
 }
 
-/// Encode a subset by name: resolve each name to its registry id via the
-/// catalog (the same mapping an application would use), then delta-encode the
-/// ids. Panics if a name isn't a known trace site.
-fn encode_names(names: &[&str]) -> String {
-    let catalog = opentelemetry_traceable::catalog::catalog();
-    let mut ids: Vec<u64> = names
-        .iter()
-        .map(|name| {
-            catalog
-                .functions
-                .iter()
-                .find(|f| f.name == *name)
-                .unwrap_or_else(|| panic!("no traceable function named `{name}`"))
-                .id
-        })
-        .collect();
-    opentelemetry_traceable::codec::encode(&mut ids)
+/// This instrumentation's enabled keys, sorted -- `enabled_names` promises that
+/// order, so tests can compare against a plain slice.
+fn enabled(instr: &Instrumentation) -> Vec<&'static str> {
+    instr.enabled_names().collect()
 }
 
 #[traceable]
@@ -119,6 +106,27 @@ impl Widget {
     }
 }
 
+// Two same-named methods on different types in one module. A registry key isn't
+// qualified by the surrounding `impl`, so both of these carry the *same* key and
+// are one selectable thing that toggles together. Deliberate, and pinned by
+// `two_sites_sharing_a_key_toggle_together` below.
+struct Left;
+struct Right;
+
+impl Left {
+    #[traceable]
+    fn shared_method(&self) -> u64 {
+        1
+    }
+}
+
+impl Right {
+    #[traceable]
+    fn shared_method(&self) -> u64 {
+        2
+    }
+}
+
 #[test]
 fn disabled_by_default_emits_no_span() {
     let (_instr, exporter) = instr("A");
@@ -132,9 +140,7 @@ fn disabled_by_default_emits_no_span() {
 #[test]
 fn enabling_emits_a_span_with_default_name() {
     let (instr, exporter) = instr("A");
-    instr
-        .enable_encoded(&encode_names(&[concat!(module_path!(), "::plain")]))
-        .unwrap();
+    instr.enable(&[concat!(module_path!(), "::plain")]).unwrap();
 
     let result = plain(1);
 
@@ -147,9 +153,7 @@ fn enabling_emits_a_span_with_default_name() {
 #[test]
 fn custom_span_name_and_the_instrumentations_tracer_scope() {
     let (instr, exporter) = instr("test-tracer");
-    instr
-        .enable_encoded(&encode_names(&["custom.span"]))
-        .unwrap();
+    instr.enable(&["custom.span"]).unwrap();
 
     let result = named();
 
@@ -166,7 +170,7 @@ fn custom_span_name_and_the_instrumentations_tracer_scope() {
 fn fields_become_span_attributes() {
     let (instr, exporter) = instr("A");
     instr
-        .enable_encoded(&encode_names(&[concat!(module_path!(), "::with_fields")]))
+        .enable(&[concat!(module_path!(), "::with_fields")])
         .unwrap();
 
     let result = with_fields("abc".to_string());
@@ -191,7 +195,7 @@ fn fields_become_span_attributes() {
 async fn async_function_is_instrumented_when_enabled() {
     let (instr, exporter) = instr("A");
     instr
-        .enable_encoded(&encode_names(&[concat!(module_path!(), "::plain_async")]))
+        .enable(&[concat!(module_path!(), "::plain_async")])
         .unwrap();
 
     let result = plain_async(1).await;
@@ -206,7 +210,7 @@ async fn async_function_is_instrumented_when_enabled() {
 fn nested_spans_share_a_trace_and_correct_parent() {
     let (instr, exporter) = instr("A");
     instr
-        .enable_encoded(&encode_names(&["nesting::parent", "nesting::child"]))
+        .enable(&["nesting::parent", "nesting::child"])
         .unwrap();
 
     let result = parent();
@@ -232,9 +236,7 @@ fn disabling_parent_does_not_suppress_enabled_child() {
     // Only the child is enabled -- the parent function still runs (and still
     // calls the child) but must not itself be wrapped in a span, and must not
     // prevent the child's span from being recorded.
-    instr
-        .enable_encoded(&encode_names(&["nesting::child"]))
-        .unwrap();
+    instr.enable(&["nesting::child"]).unwrap();
 
     let result = parent();
 
@@ -247,9 +249,7 @@ fn disabling_parent_does_not_suppress_enabled_child() {
 #[test]
 fn method_inside_impl_block_is_instrumented() {
     let (instr, exporter) = instr("A");
-    instr
-        .enable_encoded(&encode_names(&["widget::render"]))
-        .unwrap();
+    instr.enable(&["widget::render"]).unwrap();
 
     let result = Widget.render();
 
@@ -260,17 +260,12 @@ fn method_inside_impl_block_is_instrumented() {
 }
 
 #[test]
-fn set_enabled_encoded_replaces_the_active_subset() {
+fn set_enabled_replaces_the_active_subset() {
     let (instr, exporter) = instr("A");
     instr
-        .enable_encoded(&encode_names(&[
-            concat!(module_path!(), "::plain"),
-            "custom.span",
-        ]))
+        .enable(&[concat!(module_path!(), "::plain"), "custom.span"])
         .unwrap();
-    instr
-        .set_enabled_encoded(&encode_names(&["custom.span"]))
-        .unwrap();
+    instr.set_enabled(&["custom.span"]).unwrap();
 
     plain(1);
     named();
@@ -285,8 +280,10 @@ fn set_enabled_encoded_replaces_the_active_subset() {
 // should show up here even without being invoked in this test.
 #[test]
 fn registry_discovers_all_traceable_functions_in_this_binary() {
-    let names: std::collections::HashSet<_> =
-        opentelemetry_traceable::catalog::all_names().collect();
+    let names: std::collections::HashSet<_> = opentelemetry_traceable::registry::keys()
+        .iter()
+        .copied()
+        .collect();
     assert!(names.contains("custom.span"));
     assert!(names.contains("nesting::parent"));
     assert!(names.contains("nesting::child"));
@@ -297,19 +294,19 @@ fn registry_discovers_all_traceable_functions_in_this_binary() {
 fn enabled_names_reflects_the_active_subset() {
     let (instr, _exporter) = instr("A");
     instr
-        .enable_encoded(&encode_names(&["nesting::parent", "nesting::child"]))
+        .enable(&["nesting::parent", "nesting::child"])
         .unwrap();
 
-    let enabled: std::collections::HashSet<_> = instr.enabled_names().collect();
-    assert_eq!(enabled, ["nesting::parent", "nesting::child"].into());
+    // Compared as an ordered slice rather than a set: `enabled_names` sorts, and
+    // that reproducibility is a promise now that there's no id order to inherit.
+    assert_eq!(enabled(&instr), ["nesting::child", "nesting::parent"]);
 }
 
 #[test]
-fn set_enabled_encoded_toggles_spans_via_an_encoded_id_list() {
+fn set_enabled_toggles_spans_by_key() {
     let (instr, exporter) = instr("A");
-    let encoded = encode_names(&["nesting::child"]);
 
-    instr.set_enabled_encoded(&encoded).unwrap();
+    instr.set_enabled(&["nesting::child"]).unwrap();
     let result = parent();
 
     assert_eq!(result, 7);
@@ -319,13 +316,13 @@ fn set_enabled_encoded_toggles_spans_via_an_encoded_id_list() {
 }
 
 #[test]
-fn enable_and_disable_encoded_are_additive_and_subtractive() {
+fn enable_and_disable_are_additive_and_subtractive() {
     let (instr, exporter) = instr("A");
-    let both = encode_names(&["nesting::parent", "nesting::child"]);
-    let just_parent = encode_names(&["nesting::parent"]);
 
-    instr.enable_encoded(&both).unwrap();
-    instr.disable_encoded(&just_parent).unwrap();
+    instr
+        .enable(&["nesting::parent", "nesting::child"])
+        .unwrap();
+    instr.disable(&["nesting::parent"]).unwrap();
     let result = parent();
 
     assert_eq!(result, 7);
@@ -335,76 +332,125 @@ fn enable_and_disable_encoded_are_additive_and_subtractive() {
 }
 
 #[test]
-fn set_enabled_encoded_rejects_a_corrupt_encoded_id_list() {
-    let (instr, _exporter) = instr("A");
-    assert!(instr.set_enabled_encoded("not a valid list!!").is_err());
-}
+fn a_glob_enables_every_key_beneath_it() {
+    let (instr, exporter) = instr("A");
+    let selection = instr.set_enabled(&["nesting::*"]).unwrap();
 
-#[test]
-fn catalog_reports_every_traceable_function_with_a_matching_id() {
-    // Touch every traceable fn once so its local static is linked in.
-    let _ = plain(0);
-    named();
-    let _ = with_fields(String::new());
+    assert_eq!(selection.keys, ["nesting::child", "nesting::parent"]);
     parent();
-    Widget.render();
 
-    let catalog = opentelemetry_traceable::catalog::catalog();
-
-    // Ids are dense registry indices: `0..n`, each reported exactly once.
-    let mut ids: Vec<u64> = catalog.functions.iter().map(|f| f.id).collect();
-    ids.sort_unstable();
-    let n = ids.len() as u64;
-    assert_eq!(ids, (0..n).collect::<Vec<_>>(), "ids must be a dense 0..n");
-
-    // The catalog's name->id mapping is what an encoded subset is built from,
-    // so encoding a name via the catalog and applying it must enable exactly
-    // that function.
-    let by_name: std::collections::HashMap<_, _> =
-        catalog.functions.iter().map(|f| (f.name, f.id)).collect();
-    for name in [
-        "custom.span",
-        "nesting::parent",
-        "nesting::child",
-        "widget::render",
-    ] {
-        assert!(by_name.contains_key(name), "{name} missing from catalog");
-        let decoded = opentelemetry_traceable::codec::decode(&encode_names(&[name])).unwrap();
-        assert_eq!(decoded, vec![by_name[name]]);
-    }
-
-    // catalog_json() must be well-formed JSON containing the same data.
-    let json = opentelemetry_traceable::catalog::catalog_json();
-    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert!(parsed["functions"].as_array().unwrap().len() >= catalog.functions.len());
+    let mut names: Vec<String> = exporter
+        .get_finished_spans()
+        .unwrap()
+        .iter()
+        .map(|span| span.name.to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["nesting::child", "nesting::parent"]);
 }
 
 #[test]
-fn ids_depend_only_on_the_sorted_set_of_registry_keys() {
-    // An id is an index into the sorted set of registry keys -- never a raw
-    // `REGISTRY` position, and with no dependence on source location. That's
-    // what makes an encoded subset survive a rebuild: nothing about linker
-    // layout, an unrelated edit, moving a function within its file, or the build
-    // profile can perturb it. Only adding/removing a key can.
-    let names = opentelemetry_traceable::registry::names_by_id();
+fn a_bare_glob_selects_the_same_set_as_enable_all() {
+    let (via_glob, _exporter) = instr("A");
+    via_glob.set_enabled(&["*"]).unwrap();
+    let through_glob = enabled(&via_glob);
 
-    let mut expected: Vec<&str> = opentelemetry_traceable::catalog::all_names().collect();
-    expected.sort_unstable();
-    expected.dedup();
+    assert_eq!(through_glob, opentelemetry_traceable::registry::keys());
+}
+
+#[test]
+fn an_empty_selector_list_clears_everything() {
+    let (instr, exporter) = instr("A");
+    instr.enable(&["nesting::*"]).unwrap();
+
+    let cleared = instr.set_enabled::<&str>(&[]).unwrap();
+
+    assert!(cleared.keys.is_empty());
+    assert!(enabled(&instr).is_empty());
+    parent();
+    assert!(exporter.get_finished_spans().unwrap().is_empty());
+}
+
+#[test]
+fn a_glob_matching_nothing_is_reported_but_applies_the_rest() {
+    let (instr, _exporter) = instr("A");
+
+    let selection = instr
+        .enable(&["nesting::parent", "no::such::module::*"])
+        .unwrap();
+
+    assert_eq!(selection.unmatched_globs, ["no::such::module::*"]);
+    assert_eq!(enabled(&instr), ["nesting::parent"]);
+}
+
+#[test]
+fn an_unknown_exact_key_is_rejected_and_leaves_the_subset_untouched() {
+    let (instr, _exporter) = instr("A");
+    instr.enable(&["nesting::parent"]).unwrap();
+
+    // The reason resolution happens before any bit is touched: one typo must not
+    // partially apply the rest of the list.
+    let error = instr
+        .set_enabled(&["nesting::child", "nesting::typo"])
+        .expect_err("`nesting::typo` is not a registry key");
+
+    assert_eq!(error.keys, ["nesting::typo"]);
     assert_eq!(
-        names, expected,
-        "ids must follow the sorted, de-duplicated key order"
+        enabled(&instr),
+        ["nesting::parent"],
+        "a rejected selection must leave the previous subset in place"
+    );
+}
+
+#[test]
+fn two_sites_sharing_a_key_toggle_together() {
+    let (instr, exporter) = instr("A");
+    let key = concat!(module_path!(), "::shared_method");
+
+    // One selector, two call sites -- the flat registry walk matches both because
+    // they carry the same string.
+    let selection = instr.set_enabled(&[key]).unwrap();
+    assert_eq!(
+        selection.keys,
+        [key],
+        "a shared key is one selectable thing, listed once"
     );
 
-    // Ids are dense 0..n: the catalog is exactly the sorted key order, position
-    // for position, with each entry's id equal to its index.
-    let catalog = opentelemetry_traceable::catalog::catalog();
-    assert_eq!(catalog.functions.len(), names.len());
-    for (id, name) in names.iter().enumerate() {
-        let entry = &catalog.functions[id];
-        assert_eq!(entry.id, id as u64);
-        assert_eq!(entry.name, *name);
-    }
+    assert_eq!(Left.shared_method() + Right.shared_method(), 3);
+
+    let spans = exporter.get_finished_spans().unwrap();
+    assert_eq!(spans.len(), 2, "both call sites must have been enabled");
+    // The *span* name is the bare fn name; `key` is the module-qualified registry
+    // key that selects it. Both sites produce the same span name here too.
+    assert!(spans.iter().all(|span| span.name == "shared_method"));
+    assert_eq!(
+        enabled(&instr),
+        [key],
+        "and it must still be reported only once"
+    );
+}
+
+#[test]
+fn keys_are_the_sorted_deduped_registry_keys() {
+    // This no longer guards identity -- nothing is addressed by position any
+    // more, so a different order would change nothing about what a config
+    // selects. What it does guard is determinism: neither `keys()` nor the
+    // `*_names()` listings may leak the linker's arbitrary `REGISTRY` order,
+    // which shifts between builds, out to callers.
+    let keys = opentelemetry_traceable::registry::keys();
+
+    let mut expected: Vec<&str> = opentelemetry_traceable::registry::REGISTRY
+        .iter()
+        .map(|site| site.name)
+        .collect();
+    expected.sort_unstable();
+    expected.dedup();
+    assert_eq!(keys, expected);
+
+    assert!(
+        keys.windows(2).all(|pair| pair[0] < pair[1]),
+        "keys must be strictly increasing, i.e. sorted and de-duplicated"
+    );
 }
 
 // --- In-process only: `Context`'s span slot is never read or written ---------
@@ -412,9 +458,7 @@ fn ids_depend_only_on_the_sorted_set_of_registry_keys() {
 #[test]
 fn spans_never_land_in_the_ambient_context_span_slot() {
     let (instr, exporter) = instr("A");
-    instr
-        .enable_encoded(&encode_names(&["probe::ambient"]))
-        .unwrap();
+    instr.enable(&["probe::ambient"]).unwrap();
 
     // The probe reports what it sees in `Context::current().span()` from inside
     // its own traced body. A span *was* created for it (asserted below), but it
@@ -432,9 +476,7 @@ fn spans_never_land_in_the_ambient_context_span_slot() {
 #[test]
 fn does_not_join_an_ambient_incoming_parent() {
     let (instr, exporter) = instr("A");
-    instr
-        .enable_encoded(&encode_names(&["nesting::parent"]))
-        .unwrap();
+    instr.enable(&["nesting::parent"]).unwrap();
 
     // Stands in for a propagator-extracted incoming `traceparent`, or a web
     // framework's server span: a valid span context in the ambient span slot.
@@ -476,12 +518,8 @@ fn child_only_creates_no_span_without_an_active_parent() {
     let (instr, exporter) = instr("A");
     // Enabled AND put in child-only mode, but called directly with no active
     // parent for this instrumentation -- must stay silent, not orphan a root.
-    instr
-        .enable_encoded(&encode_names(&["shared::leaf"]))
-        .unwrap();
-    instr
-        .set_child_only_encoded(&encode_names(&["shared::leaf"]))
-        .unwrap();
+    instr.enable(&["shared::leaf"]).unwrap();
+    instr.set_child_only(&["shared::leaf"]).unwrap();
 
     let result = shared_leaf();
 
@@ -492,12 +530,8 @@ fn child_only_creates_no_span_without_an_active_parent() {
 #[test]
 fn child_only_nests_correctly_under_an_active_parent() {
     let (instr, exporter) = instr("A");
-    instr
-        .enable_encoded(&encode_names(&["shared::root", "shared::leaf"]))
-        .unwrap();
-    instr
-        .set_child_only_encoded(&encode_names(&["shared::leaf"]))
-        .unwrap();
+    instr.enable(&["shared::root", "shared::leaf"]).unwrap();
+    instr.set_child_only(&["shared::leaf"]).unwrap();
 
     let result = shared_root();
 
@@ -515,12 +549,8 @@ fn child_only_mode_still_respects_the_enabled_flag() {
     // Root enabled, leaf's own flag left off -- child-only only relaxes the
     // "needs a parent" requirement, it doesn't bypass the function's own
     // enabled flag.
-    instr
-        .enable_encoded(&encode_names(&["shared::root"]))
-        .unwrap();
-    instr
-        .set_child_only_encoded(&encode_names(&["shared::leaf"]))
-        .unwrap();
+    instr.enable(&["shared::root"]).unwrap();
+    instr.set_child_only(&["shared::leaf"]).unwrap();
 
     let result = shared_root();
 
@@ -538,9 +568,7 @@ fn child_only_is_a_runtime_mode_the_same_fn_can_root_or_not() {
     let (instr, exporter) = instr("A");
 
     // Not child-only: called directly, it roots its own span.
-    instr
-        .enable_encoded(&encode_names(&["shared::leaf"]))
-        .unwrap();
+    instr.enable(&["shared::leaf"]).unwrap();
     assert_eq!(shared_leaf(), 5);
     let spans = exporter.get_finished_spans().unwrap();
     assert_eq!(spans.len(), 1);
@@ -548,9 +576,7 @@ fn child_only_is_a_runtime_mode_the_same_fn_can_root_or_not() {
 
     // Flip the same function into child-only mode: now it suppresses itself.
     exporter.reset();
-    instr
-        .set_child_only_encoded(&encode_names(&["shared::leaf"]))
-        .unwrap();
+    instr.set_child_only(&["shared::leaf"]).unwrap();
     assert_eq!(shared_leaf(), 5);
     assert!(exporter.get_finished_spans().unwrap().is_empty());
 }
@@ -559,12 +585,8 @@ fn child_only_is_a_runtime_mode_the_same_fn_can_root_or_not() {
 async fn child_only_works_for_async_functions_too() {
     let (instr, exporter) = instr("A");
 
-    instr
-        .enable_encoded(&encode_names(&["shared::async_leaf"]))
-        .unwrap();
-    instr
-        .set_child_only_encoded(&encode_names(&["shared::async_leaf"]))
-        .unwrap();
+    instr.enable(&["shared::async_leaf"]).unwrap();
+    instr.set_child_only(&["shared::async_leaf"]).unwrap();
     let result = shared_async_leaf().await;
     assert_eq!(result, 5);
     assert!(
@@ -573,7 +595,7 @@ async fn child_only_works_for_async_functions_too() {
     );
 
     instr
-        .enable_encoded(&encode_names(&["shared::async_root", "shared::async_leaf"]))
+        .enable(&["shared::async_root", "shared::async_leaf"])
         .unwrap();
     let result = shared_async_root().await;
     assert_eq!(result, 5);
@@ -595,7 +617,7 @@ fn child_only_names_reflects_the_configured_set() {
     let (instr, _exporter) = instr("A");
 
     instr
-        .set_child_only_encoded(&encode_names(&["shared::leaf", "shared::async_leaf"]))
+        .set_child_only(&["shared::leaf", "shared::async_leaf"])
         .unwrap();
     let names: std::collections::HashSet<_> = instr.child_only_names().collect();
 
@@ -612,10 +634,8 @@ fn two_instrumentations_isolate_their_spans_and_traces() {
     let (b, exp_b) = instr("B");
 
     // Overlapping enabled sets: both trace the parent, only A traces the child.
-    a.enable_encoded(&encode_names(&["nesting::parent", "nesting::child"]))
-        .unwrap();
-    b.enable_encoded(&encode_names(&["nesting::parent"]))
-        .unwrap();
+    a.enable(&["nesting::parent", "nesting::child"]).unwrap();
+    b.enable(&["nesting::parent"]).unwrap();
 
     let _ = parent();
 
@@ -641,10 +661,8 @@ fn each_instrumentation_nests_independently() {
     let (b, exp_b) = instr("B");
 
     // A traces one parent/child pair, B a different one.
-    a.enable_encoded(&encode_names(&["nesting::parent", "nesting::child"]))
-        .unwrap();
-    b.enable_encoded(&encode_names(&["shared::root", "shared::leaf"]))
-        .unwrap();
+    a.enable(&["nesting::parent", "nesting::child"]).unwrap();
+    b.enable(&["shared::root", "shared::leaf"]).unwrap();
 
     let _ = parent();
     let _ = shared_root();
@@ -671,10 +689,8 @@ fn the_same_function_traced_by_two_instrumentations_yields_separate_traces() {
 
     // The same function enabled in both -- each produces its own span in its
     // own tracer/backend, in its own trace.
-    a.enable_encoded(&encode_names(&["nesting::parent"]))
-        .unwrap();
-    b.enable_encoded(&encode_names(&["nesting::parent"]))
-        .unwrap();
+    a.enable(&["nesting::parent"]).unwrap();
+    b.enable(&["nesting::parent"]).unwrap();
 
     let _ = parent();
 
@@ -698,10 +714,9 @@ fn child_only_is_per_instrumentation() {
 
     // Both enable the shared leaf; A puts it in child-only mode, B leaves it
     // root-capable. Called directly (no parent), A must suppress it, B must not.
-    a.enable_encoded(&encode_names(&["shared::leaf"])).unwrap();
-    a.set_child_only_encoded(&encode_names(&["shared::leaf"]))
-        .unwrap();
-    b.enable_encoded(&encode_names(&["shared::leaf"])).unwrap();
+    a.enable(&["shared::leaf"]).unwrap();
+    a.set_child_only(&["shared::leaf"]).unwrap();
+    b.enable(&["shared::leaf"]).unwrap();
 
     let _ = shared_leaf();
 
@@ -717,8 +732,7 @@ fn child_only_is_per_instrumentation() {
 #[test]
 fn dropping_an_instrumentation_stops_new_spans_and_frees_its_slot() {
     let (a, exp_a) = instr("A");
-    a.enable_encoded(&encode_names(&["nesting::parent"]))
-        .unwrap();
+    a.enable(&["nesting::parent"]).unwrap();
     let _ = parent();
     assert_eq!(exp_a.get_finished_spans().unwrap().len(), 1);
 
@@ -733,8 +747,7 @@ fn dropping_an_instrumentation_stops_new_spans_and_frees_its_slot() {
     // A fresh instrumentation still allocates cleanly and works -- and since the
     // dropped one released its slot, this may well be the very same slot.
     let (c, exp_c) = instr("C");
-    c.enable_encoded(&encode_names(&["nesting::parent"]))
-        .unwrap();
+    c.enable(&["nesting::parent"]).unwrap();
     let _ = parent();
     assert_eq!(exp_c.get_finished_spans().unwrap().len(), 1);
 }
@@ -746,8 +759,7 @@ fn slots_are_reused_so_churn_does_not_exhaust_them() {
     let total = opentelemetry_traceable::instrumentation::MAX_INSTRUMENTATIONS * 3;
     for i in 0..total {
         let (one, exporter) = instr("churn");
-        one.enable_encoded(&encode_names(&["nesting::child"]))
-            .unwrap();
+        one.enable(&["nesting::child"]).unwrap();
         let _ = child();
         assert_eq!(
             exporter.get_finished_spans().unwrap().len(),
@@ -760,7 +772,7 @@ fn slots_are_reused_so_churn_does_not_exhaust_them() {
 #[tokio::test]
 async fn instrumentation_works_across_await_points() {
     let (a, exp_a) = instr("A");
-    a.enable_encoded(&encode_names(&["shared::async_root", "shared::async_leaf"]))
+    a.enable(&["shared::async_root", "shared::async_leaf"])
         .unwrap();
 
     let _ = shared_async_root().await;

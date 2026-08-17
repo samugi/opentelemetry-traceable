@@ -37,7 +37,7 @@ let instr = Instrumentation::builder()
     .tracer(provider.tracer("checkout-debug"))  // any opentelemetry Tracer; required
     .build()?;                                  // Err(SlotsExhausted) if 64 are already live
 
-instr.set_enabled_encoded(&encoded)?; // a compact id list — see "Compact subset encoding"
+instr.set_enabled(&["my_crate::checkout::*"])?; // keys and/or globs — see "Selecting functions"
 ```
 
 `opentelemetry` is re-exported as `opentelemetry_traceable::opentelemetry` rather than being a
@@ -62,40 +62,48 @@ Disabling a function only skips *its own* span — an enabled function still nes
 recording ancestor span **of the same instrumentation**, whether or not everything in between is
 enabled.
 
-Registry key (the string a function is listed under, and the id you configure by) defaults to
-`module_path!() + "::" + fn_name`, or the `name` argument if given. Note this isn't qualified by a
-surrounding `impl` type — two methods with the same name in the same module share a key unless
-`name` disambiguates them.
+A function's **registry key** — the string it's listed under, and the thing you configure by —
+defaults to `module_path!() + "::" + fn_name`, or the `name` argument if given. It's the whole
+identity of a trace site: there is no id or index, and nothing is addressed by position. Note it
+isn't qualified by a surrounding `impl` type — two methods with the same name in the same module
+share a key, and therefore toggle together, unless `name` disambiguates them.
 
 The macro takes only `name` and `fields(...)`. There is deliberately no `tracer` argument: a call
 site never names or looks up a tracer, because each instrumentation supplies its own.
 
 ## Configuring an instrumentation
 
-An instrumentation is configured exclusively through compact encoded id lists (see
-[Compact subset encoding](#compact-subset-encoding) below for how `encoded` is produced) — there's
-no name-based way to enable/disable. A name list doesn't scale as a wire format: 100 names out of a
-100,000-function registry is 4-6 KB of configuration just to select 0.1% of it, so encoded ids are
-the only way in.
+An instrumentation is configured by **naming the functions it should trace** — their registry keys,
+or `*` globs over them. That's the whole interface; the way DTrace names probes, over a probe set
+that happens to be declared at compile time.
 
 ```rust
-instr.set_enabled_encoded(&encoded)?;    // replace the whole enabled set
-instr.enable_encoded(&encoded)?;         // additive
-instr.disable_encoded(&encoded)?;        // subtractive
-instr.enable_all();                      // every registered function
-instr.disable_all();                     // none
+instr.set_enabled(&["my_crate::checkout"])?;   // replace the whole enabled set
+instr.enable(&["my_crate::db::*"])?;           // additive
+instr.disable(&["my_crate::db::*"])?;          // subtractive
+instr.enable_all();                            // every registered function
+instr.disable_all();                           // none
 
-instr.set_child_only_encoded(&encoded)?; // replace the child-only set
+instr.set_child_only(&["my_crate::db::*"])?;   // replace the child-only set
 
-instr.enabled_names();                   // -> impl Iterator<Item = &'static str>, read-only
-instr.child_only_names();                // -> impl Iterator<Item = &'static str>, read-only
+instr.enabled_names();                         // -> impl Iterator<Item = &'static str>, read-only
+instr.child_only_names();                      // -> impl Iterator<Item = &'static str>, read-only
 
-opentelemetry_traceable::catalog::all_names();            // -> every registered key, regardless of instrumentation
+opentelemetry_traceable::registry::keys();     // -> every registered key, regardless of instrumentation
 ```
 
-`enabled_names` / `child_only_names` are introspection only — configuration always goes in as
-encoded ids. `all_names()` lives on the catalog, not on a handle, because the set of linked
-`#[traceable]` functions is a property of the binary.
+All four setters take a slice of selectors and return `Result<Selection, UnknownKeys>` — see
+[Selecting functions by key](#selecting-functions-by-key). `enabled_names` / `child_only_names` are
+introspection only, and both are sorted. `keys()` lives on the registry rather than on a handle,
+because the set of linked `#[traceable]` functions is a property of the binary, not of any one
+instrumentation.
+
+A key list scales through globs rather than through compression: selecting a module is one selector
+no matter how large the registry is, and unlike a fixed list it keeps covering functions added to
+that module later. Where a subset genuinely is a hundred unrelated functions, it's a hundred lines
+of configuration you can read, diff, and review — which is worth more than the bytes it costs, given
+this is a config file rather than a wire format. (Earlier versions did compress: see
+[Selecting functions by key](#selecting-functions-by-key) for why that was the wrong trade.)
 
 ### Running several at once
 
@@ -113,8 +121,8 @@ let db_audit = Instrumentation::builder()
     .tracer(audit_provider.tracer("db-audit"))
     .build()?;
 
-checkout.set_enabled_encoded(&checkout_subset)?;
-db_audit.set_enabled_encoded(&db_subset)?;
+checkout.set_enabled(&["my_crate::checkout", "my_crate::orders::*"])?;
+db_audit.set_enabled(&["my_crate::db::*"])?;
 ```
 
 Each builds a fully independent trace from the same physical call chain: a function enabled for
@@ -167,7 +175,7 @@ span when that instrumentation already has a recording span on the current call 
 root, even when enabled.
 
 ```rust
-instr.set_child_only_encoded(&encoded)?; // same compact id list as the enabled set
+instr.set_child_only(&["my_crate::db::*"])?; // same selectors as the enabled set
 ```
 
 Child-only is orthogonal to enabled, and scoped to one instrumentation: a function must be enabled
@@ -187,103 +195,109 @@ call graph: a function should be child-only exactly when one of its own callers 
 traced (so it always has a parent), and root-capable otherwise. That's the rule the agent
 workflow below applies.
 
-## Compact subset encoding
+## Selecting functions by key
 
-`opentelemetry_traceable::codec` encodes an arbitrary selection of functions as a **lossless delta-encoded id
-list** instead of a name list. The ids are sorted, turned into LEB128 varint deltas, then
-base64'd (URL-safe, unpadded). There are **no false positives**: exactly the listed functions
-are toggled, nothing else.
+A selector is either an exact registry key or a glob. **`*` matches any run of characters,
+including `::`** — that's the only wildcard, and there's deliberately no `**` counterpart, because
+how deeply a function is nested is an implementation detail of the code being traced, not something
+the person selecting it should have to track.
 
-```rust
-let mut ids = vec![0, 3, 7];
-let encoded = opentelemetry_traceable::codec::encode(&mut ids);
-instr.set_enabled_encoded(&encoded)?;   // replace the whole enabled set
-instr.enable_encoded(&encoded)?;        // additive
-instr.disable_encoded(&encoded)?;       // subtractive
+```text
+my_app::domain::db::*   matches  my_app::domain::db::query
+                        matches  my_app::domain::db::users::insert   (nested — `*` spans `::`)
+                    does NOT match  my_app::domain::db               (nothing after the separator)
+*::db::*                matches  any db function, in any crate or module
+*                       matches  everything — the config-file equivalent of `enable_all()`
 ```
 
-An `id` is a `#[traceable]` function's index in the **sorted set of registry keys**
-(`opentelemetry_traceable::registry::names_by_id`): dense, 0-based, and reported by `opentelemetry_traceable::catalog`. Sorting is
-done in place, which is why `encode` takes `&mut [u64]`. Decoding is
-`opentelemetry_traceable::codec::decode(&str) -> Result<Vec<u64>, opentelemetry_traceable::codec::DecodeError>`; a corrupt string
-returns `Err(DecodeError)` and leaves state unchanged.
+`opentelemetry_traceable::selector::resolve` is the entry point, and doubles as a dry run: it
+resolves selectors against the registry without applying anything, so a glob can be previewed
+before it's committed to a config file.
 
-Ids are build-scoped, not instrumentation-scoped: the same encoded string means the same set of
-functions for every instrumentation in that binary.
+```rust
+let selection = opentelemetry_traceable::selector::resolve(&["my_app::db::*"])?;
+selection.keys;             // -> Vec<&'static str>, sorted and deduplicated
+selection.unmatched_globs;  // -> globs that matched nothing
+```
 
-### When ids change
+### Typos are errors, empty globs are warnings
 
-An id depends on nothing but the set of registry keys, so it survives rebuilds, edits anywhere in
-the source, moving functions around, and differing profiles — debug and release agree. **Adding or
-removing a `#[traceable]` key renumbers the ids after it**, and that's the only thing that
-invalidates an encoded string; regenerate the catalog and re-encode.
+An **exact** selector that matches nothing is almost certainly a typo, so resolution fails with
+`UnknownKeys` (which names every offender, not just the first) and **nothing is applied** — the
+instrumentation keeps whatever set it already had. Tracing an unnoticed subset of what was asked for
+is worse than refusing outright, which is why the whole list is resolved before a single bit is
+touched.
 
-Deriving ids from keys rather than from registry position is what makes that hold: `linkme` gives
-no ordering guarantee and its order does shift between builds. Keeping them dense (rather than
-hashing each key into a build-independent `u64`) is what keeps the encoding compact, and sorting by
-key clusters a module's functions onto consecutive ids, so module-shaped subsets encode especially
-small.
+A **glob** that matches nothing only shows up in `Selection::unmatched_globs`, because it can
+legitimately match nothing in a build where those functions were compiled out. If both happen at
+once, the error wins and nothing is applied.
 
 Two call sites can share a key — two methods with the same name in the same module, absent a `name`
-override. They share an id and toggle together.
+override. One selector matches both, so they toggle together, and they're listed once.
 
-To enable *everything* without enumerating every id from code, call `instr.enable_all()`. For a
-config-file-driven setup, encode every id from the catalog instead. "Disable everything" is still
-just an empty enabled string.
+"Enable everything" is `instr.enable_all()` from code, or `["*"]` from a config file. "Disable
+everything" is an empty selector list.
+
+### Why not ids
+
+Earlier versions configured through a compact encoded string: an id was a function's index into the
+sorted set of registry keys, delta-encoded as LEB128 varints and base64'd. Keys were still the
+underlying identity — indices into their sorted set were what made ids reproducible, since `linkme`
+gives no ordering guarantee and its order does shift between builds.
+
+Two things made that the wrong trade:
+
+- **Ids were stable against rebuilds, but not against edits.** Adding or removing any `#[traceable]`
+  function renumbered every id after it alphabetically, and the failure was *silent* — a stale
+  string still decoded to perfectly valid ids that now pointed at the *wrong* functions. You'd trace
+  things you didn't ask for and miss the ones you did, with nothing reported. A wrong *key*, by
+  contrast, matches nothing and gets named in an error.
+- **The compactness bought nothing.** These strings never travelled in a header, in baggage, or
+  per-request; their only destination was a hand-edited config file, where a few dozen bytes are
+  worth far less than being able to read what you're looking at. What it actually cost was opacity —
+  a value like `AQQIAwIBAQICAgUBAgQBAgIGCAk` needs a prose comment to explain itself, and that
+  comment can drift from the value with nothing to catch it.
+
+Globs also cover the case ids were best at. A module-shaped subset used to encode especially small
+because sorting clustered a module's functions onto consecutive ids; now it's one selector, and it
+keeps matching functions added to that module later instead of going stale.
 
 ## Letting an LLM (or a script) configure an arbitrary subset
 
-This is the intended workflow when the thing picking which functions to trace has source
-access but isn't running Rust, or is choosing from thousands of candidates and can't
-reasonably be handed a plain name list:
+This is the intended workflow when the thing picking which functions to trace has source access but
+isn't running Rust, or is choosing from thousands of candidates:
 
-1. **Dump the catalog.** From within your instrumented application (an admin endpoint, a debug
-   CLI flag, a one-off example — `opentelemetry-traceable` has no way to know how *your* app wants to expose
-   this, so it just provides the data):
+1. **Dump the keys.** From within your instrumented application (an admin endpoint, a debug CLI
+   flag, a one-off example — `opentelemetry-traceable` has no way to know how *your* app wants to
+   expose this, so it just provides the data):
    ```rust
-   let json = opentelemetry_traceable::catalog::catalog_json();
-   ```
-   This returns every `#[traceable]` function currently linked into the binary, each with the
-   same registry-index id `opentelemetry_traceable::codec` uses internally:
-   ```json
-   {
-     "functions": [
-       { "name": "my_crate::process", "id": 0 },
-       { "name": "kafka.fetch", "id": 1 }
-     ]
+   for key in opentelemetry_traceable::registry::keys() {
+       println!("{key}");
    }
    ```
-   Ids are stable across rebuilds; regenerate this when you add or remove a `#[traceable]`
-   function (see [When ids change](#when-ids-change)).
-
+   That's every `#[traceable]` function currently linked into the binary, sorted:
+   ```text
+   kafka.fetch
+   my_crate::process
+   ```
    This is the *node* list. Call-graph edges aren't known to the running binary — the consumer
    derives them from your source, and they're what decide which functions can root a trace and
    which should be child-only so the hierarchy stays intact.
-2. **Hand that JSON to the consumer** (an LLM with access to your source, a script, an
-   operator) along with the task: "pick whichever of these functions should be traced."
-3. **Turn the picks into an encoded id list:**
-   ```rust
-   let mut ids = chosen_ids;
-   let encoded = opentelemetry_traceable::codec::encode(&mut ids);
-   ```
-   Expose that the same way you exposed the catalog, so the consumer can encode its own picks
-   without writing Rust — the ids index this binary's registry, so nothing outside it can do the
-   encoding on its behalf. (`opentelemetry-traceable-demo` wires both up as `catalog` and `encode --ids`
-   subcommands.)
-4. **Apply it** to the instrumentation that should trace that subset:
-   `instr.set_enabled_encoded(&encoded)?`.
+2. **Hand that list to the consumer** (an LLM with access to your source, a script, an operator)
+   along with the task: "pick whichever of these functions should be traced."
+3. **Apply the picks** to the instrumentation that should trace that subset — the keys go in
+   directly, so there's no encoding step and nothing for the consumer to run against your binary
+   first: `instr.set_enabled(&chosen_keys)?`.
 
-### The encoding, if you need to reproduce it without this crate
+Because keys are the identity, the consumer's output *is* the configuration: it can write the keys
+straight into a config file, and a glob lets it express "the whole `db` module" as one line rather
+than enumerating it. A flow-shaped request — an entry point plus its transitive callees — still needs
+the explicit list, since a flow isn't a module.
 
-Simple enough to reimplement in a short script, given a catalog dump's list of chosen `id`s
-(each an index into the registry):
-
-1. **Sort** the chosen ids ascending.
-2. **Delta**: replace each id with its difference from the previous one (the first is left
-   as-is), so you have a list of non-negative deltas.
-3. **Varint**: encode each delta as an LEB128 unsigned varint (7 bits per byte, low bit of the
-   continuation flag set on all but the last byte).
-4. **Wire format**: concatenate the varint bytes, then base64 (URL-safe, unpadded).
+Worth exposing a dry run too, so a selection can be checked before it's committed:
+`opentelemetry_traceable::selector::resolve(&picks)` reports exactly which keys matched and which
+globs matched nothing, without touching any instrumentation. (`opentelemetry-traceable-demo` wires
+both up as `keys` and `keys --select`.)
 
 ## For coding agents: `agents/AGENTS.md` and `agents/SKILL.md`
 
@@ -295,9 +309,9 @@ this whole README.
 - `agents/SKILL.md` → copy to the application repo as a manually-invoked Claude Code skill, e.g.
   `.claude/skills/configure-tracing/SKILL.md`.
 
-Both drive the application's own catalog and encode entry points (step 1 and 5), read its source
-to derive the call graph, then apply the child-only rule above so the resulting hierarchy holds
-together. They expect the app to expose those two entry points and ask the user if it doesn't.
+Both drive the application's own key-listing entry point, read its source to derive the call graph,
+then apply the child-only rule above so the resulting hierarchy holds together. They expect the app
+to expose that entry point and ask the user if it doesn't.
 See `opentelemetry-traceable-demo/AGENTS.md` and `opentelemetry-traceable-demo/.claude/skills/configure-tracing/SKILL.md` for a
 working copy.
 
@@ -307,8 +321,8 @@ working copy.
   (so consumers never declare it themselves — see Quick start), `registry` (the
   `linkme`-collected `TraceSite`/`REGISTRY`, one enabled/child-only bitmask pair per site),
   `instrumentation` (`Instrumentation` + its builder — creating, configuring, and dropping
-  instrumentations, plus the `start_spans` hot path), `codec` (lossless delta-encoded id list
-  encode/decode), `catalog` (the `{name, id}` dump and `all_names`).
+  instrumentations, plus the `start_spans` hot path), `selector` (key/glob matching and
+  `resolve`).
 - `opentelemetry-traceable-macros` — the `#[traceable]` proc-macro implementation.
 
 ## Benchmarks
