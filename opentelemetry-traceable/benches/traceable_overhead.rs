@@ -83,64 +83,7 @@ fn tracing_instrument_fn(n: u64) -> u64 {
     workload(n)
 }
 
-/// 64 distinct `#[traceable]` sites, so a benchmark can round-robin across them
-/// instead of hammering one. The existing benchmarks call a single function in a
-/// tight loop, which keeps that one site's registry entry permanently in L1 --
-/// so they are structurally unable to detect the cost of *per-site* memory
-/// access. Anything that adds an indirection per trace site needs these to have
-/// a recorded baseline, or "no regression" is an unverifiable claim.
-macro_rules! many_sites {
-    ($($name:ident)*) => {
-        $(
-            #[traceable]
-            fn $name(n: u64) -> u64 {
-                workload(n)
-            }
-        )*
-        /// Every site declared above, for round-robin dispatch.
-        static MANY_SITES: &[fn(u64) -> u64] = &[$($name),*];
-    };
-}
-
-many_sites!(
-    s00 s01 s02 s03 s04 s05 s06 s07 s08 s09 s10 s11 s12 s13 s14 s15
-    s16 s17 s18 s19 s20 s21 s22 s23 s24 s25 s26 s27 s28 s29 s30 s31
-    s32 s33 s34 s35 s36 s37 s38 s39 s40 s41 s42 s43 s44 s45 s46 s47
-    s48 s49 s50 s51 s52 s53 s54 s55 s56 s57 s58 s59 s60 s61 s62 s63
-);
-
-/// The single-site control for the `MANY_SITES` comparison. Benchmarked through
-/// the identical dispatch loop, so the *only* difference between the `one_site`
-/// and `many_sites` numbers is how many distinct registry entries get touched.
-static ONE_SITE: &[fn(u64) -> u64] = &[traceable_fn];
-
-/// Dispatches round-robin through `$sites` with a fixed loop shape, so the
-/// index arithmetic and bounds check are paid identically by every variant.
-macro_rules! round_robin_bench {
-    ($group:expr, $id:literal, $sites:expr) => {
-        $group.bench_function($id, |b| {
-            let sites: &[fn(u64) -> u64] = $sites;
-            let mut i = 0usize;
-            b.iter(|| {
-                let f = sites[i];
-                i += 1;
-                if i == sites.len() {
-                    i = 0;
-                }
-                f(black_box(LIGHT_ITERATIONS))
-            });
-        });
-    };
-}
-
 const WORKLOAD_ITERATIONS: u64 = 1_000;
-
-/// A deliberately tiny body for the round-robin variants. The 1000-iteration
-/// workload above dwarfs per-call overhead by design (that's the point of the
-/// headline numbers), which also means it would mask a few nanoseconds of extra
-/// per-site memory traffic. Keeping this small makes that traffic a visible
-/// fraction of the measurement.
-const LIGHT_ITERATIONS: u64 = 8;
 
 fn bench_traceable_overhead(c: &mut Criterion) {
     let mut group = c.benchmark_group("traceable_overhead");
@@ -154,11 +97,6 @@ fn bench_traceable_overhead(c: &mut Criterion) {
     group.bench_function("traceable_disa", |b| {
         b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
     });
-
-    // Still with nothing tracing: the disabled gate read, one site vs. 64. The
-    // *difference* between these two is the per-site cost of the gate itself.
-    round_robin_bench!(group, "light_one_site_disa", ONE_SITE);
-    round_robin_bench!(group, "light_many_sites_disa", MANY_SITES);
 
     // Real (if in-process) exporters throughout, so the "enabled" numbers
     // reflect actual span construction + export cost rather than a no-op
@@ -177,12 +115,6 @@ fn bench_traceable_overhead(c: &mut Criterion) {
     group.bench_function("traceable_one_instr_enab", |b| {
         b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));
     });
-
-    // The enabled path, one site vs. 64. This is the pair that would surface a
-    // per-site indirection added to `start_spans`.
-    round_robin_bench!(group, "light_one_site_enab", ONE_SITE);
-    round_robin_bench!(group, "light_many_sites_enab", MANY_SITES);
-
     instr1.disable_all();
     group.bench_function("traceable_one_instr_disa", |b| {
         b.iter(|| traceable_fn(black_box(WORKLOAD_ITERATIONS)));

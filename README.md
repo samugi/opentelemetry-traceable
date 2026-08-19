@@ -240,27 +240,13 @@ everything" is an empty selector list.
 
 ### Why not ids
 
-Earlier versions configured through a compact encoded string: an id was a function's index into the
-sorted set of registry keys, delta-encoded as LEB128 varints and base64'd. Keys were still the
-underlying identity — indices into their sorted set were what made ids reproducible, since `linkme`
-gives no ordering guarantee and its order does shift between builds.
-
-Two things made that the wrong trade:
-
-- **Ids were stable against rebuilds, but not against edits.** Adding or removing any `#[traceable]`
-  function renumbered every id after it alphabetically, and the failure was *silent* — a stale
-  string still decoded to perfectly valid ids that now pointed at the *wrong* functions. You'd trace
-  things you didn't ask for and miss the ones you did, with nothing reported. A wrong *key*, by
-  contrast, matches nothing and gets named in an error.
-- **The compactness bought nothing.** These strings never travelled in a header, in baggage, or
-  per-request; their only destination was a hand-edited config file, where a few dozen bytes are
-  worth far less than being able to read what you're looking at. What it actually cost was opacity —
-  a value like `AQQIAwIBAQICAgUBAgQBAgIGCAk` needs a prose comment to explain itself, and that
-  comment can drift from the value with nothing to catch it.
-
-Globs also cover the case ids were best at. A module-shaped subset used to encode especially small
-because sorting clustered a module's functions onto consecutive ids; now it's one selector, and it
-keeps matching functions added to that module later instead of going stale.
+Earlier versions configured through a compact encoded string of numeric ids. That was dropped
+because ids were silently invalidated by the most likely edit there is: adding or removing a
+`#[traceable]` function renumbered every id after it, and a stale string still decoded to valid ids
+now pointing at the *wrong* functions, with nothing reported. A wrong key matches nothing and gets
+named in an error. See [`docs/multi-instrumentation.md`](docs/multi-instrumentation.md) —
+"History: the ids this replaced" — for the full record, including the two id schemes that came
+before and what they cost.
 
 ## Letting an LLM (or a script) configure an arbitrary subset
 
@@ -348,13 +334,10 @@ With no instrumentation tracing a function, `#[traceable]` costs the same as no 
 within noise — the mask is `0` and the macro dispatch is a single atomic load followed by the raw
 body. Enabled adds the real cost of span construction and export, once per active instrumentation.
 
-Dropping the special-cased default instrumentation is a small, honest trade. Previously a
-hardcoded `mask == 1` path ran a single span against a process-global tracer at ~1.21 µs, so the
-single-instrumentation case now costs ~35 ns more (1.21 → 1.245 µs). In exchange the multi-slot
-path got *faster*, because `start_spans` no longer carries the slot-0 branch and its
-`slot0_cx`/`env_changed` bookkeeping: one named instrumentation went 1.29 → 1.245 µs and two went
-1.58 → 1.488 µs. One uniform path, slightly cheaper as soon as you have more than a single
-instrumentation.
+Removing the special-cased default instrumentation cost the single-instrumentation case ~35 ns and
+made every multi-instrumentation case faster — see
+[`docs/multi-instrumentation.md`](docs/multi-instrumentation.md) — "Measured result" — for the
+before/after numbers.
 
 ## Development
 

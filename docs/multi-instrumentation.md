@@ -118,12 +118,14 @@ returning `Result<Selection, UnknownKeys>` (see
   the slot after clearing its bits and removing its tracer, so
   `MAX_INSTRUMENTATIONS` bounds *concurrently live* instrumentations rather than
   lifetime creations. `SlotsExhausted` therefore only fires with 64 alive at once.
-- **Slot table:** `ArcSwap<[Option<Arc<dyn DynTracer>>; 64]>`. Hot-path read =
-  one atomic pointer load, no lock; rare writes (build/drop) swap the whole
-  table.
-- **`Drop`:** clears its bit from every site's masks (stops new spans), drops the
-  tracer, then releases the slot. In-flight spans are independent `Arc`-owned
-  objects and finish/export normally.
+- **Slot state:** one `ArcSwap<Slots>` holding both the tracer table
+  (`[Option<Arc<dyn DynTracer>>; 64]`) and the free-list allocator, so build and
+  drop are each a single publish. Hot-path read = one atomic pointer load, no
+  lock; rare writes (build/drop) swap the whole snapshot under a writer-only
+  mutex (allocation isn't idempotent, so `ArcSwap::rcu`'s retry can't be used).
+- **`Drop`:** clears its bit from every site's masks (stops new spans), then
+  drops the tracer and releases the slot in one publish. In-flight spans are
+  independent `Arc`-owned objects and finish/export normally.
 - **Ordering:** masks use `Relaxed` (same eventually-consistent config semantics
   as the old `AtomicBool`).
 
@@ -377,10 +379,8 @@ without a single benchmark moving.
 - `opentelemetry-traceable/src/registry.rs` — `TraceSite` masks, the `REGISTRY` slice, and
   `keys()`, the sorted deduplicated discovery list.
 - `opentelemetry-traceable/src/instrumentation.rs` — `Instrumentation`, `InstrumentationBuilder`,
-  constants, `SlotMask`/`SLOT_BITS` (the one place the instrumentation ceiling is
-  decided, with a `const` assertion tying it to `MAX_INSTRUMENTATIONS`), the
-  `ArcSwap<Slots>` snapshot holding both the tracer table and the free-list
-  allocator, shared bit-op helpers, `DynTracer`, `MultiInstrumentState`,
+  constants, the `ArcSwap<Slots>` snapshot holding both the tracer table and the
+  free-list allocator, shared bit-op helpers, `DynTracer`, `MultiInstrumentState`,
   `start_spans`.
 - `opentelemetry-traceable/src/selector.rs` — `matches` / `is_glob` / `resolve`, plus
   `Selection` and `UnknownKeys`.
@@ -391,10 +391,4 @@ without a single benchmark moving.
   in-process-only assertions.
 - `opentelemetry-traceable/tests/selector.rs` — glob-matching table, and `resolve` against the
   test binary's own registry (unknown-key errors, unmatched globs).
-- `opentelemetry-traceable/benches/traceable_overhead.rs` — per-instrumentation-count cases,
-  plus `light_{one_site,many_sites}_{disa,enab}`: 64 distinct sites dispatched
-  round-robin under a deliberately tiny body. The headline cases call one function
-  in a tight loop, so that site's registry entry never leaves L1 and they cannot
-  detect *per-site* memory cost; these can. Note the harness's run-to-run noise on
-  a laptop is around ±8% — `no_macro` alone varies that much between runs — so
-  small deltas here need repeated runs before they mean anything.
+- `opentelemetry-traceable/benches/traceable_overhead.rs` — per-instrumentation-count cases.

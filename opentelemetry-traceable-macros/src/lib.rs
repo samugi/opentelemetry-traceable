@@ -151,17 +151,15 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
 
     // The `fields(...)` as `KeyValue` expressions, handed to `start_spans` so
     // every active instrumentation stamps the same attributes on its own span.
-    let kvs: Vec<TokenStream2> = match &args.fields {
-        None => Vec::new(),
-        Some(fields) => fields
-            .iter()
-            .map(|f| {
-                let key = &f.key;
-                let value = &f.value;
-                quote! { ::opentelemetry_traceable::opentelemetry::KeyValue::new(#key, #value) }
-            })
-            .collect(),
-    };
+    let kvs: Vec<TokenStream2> = args
+        .fields
+        .iter()
+        .flatten()
+        .map(|f| {
+            let (key, value) = (&f.key, &f.value);
+            quote! { ::opentelemetry_traceable::opentelemetry::KeyValue::new(#key, #value) }
+        })
+        .collect();
 
     // `start_spans` builds one child span per active slot (with that slot's own
     // tracer and parent) and hands back the single context to attach, or `None`
