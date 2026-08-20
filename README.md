@@ -24,13 +24,24 @@ async fn handle(id: String) { /* ... */ }
 
 Nothing traces yet. An **`Instrumentation`** is the only way to turn tracing on — there is no
 global or default instrumentation, and no process-wide tracer. Each `Instrumentation` brings its
-own `Tracer`, holds its own enabled subset, and builds its own isolated span hierarchy:
+own `Tracer`, holds its own enabled subset, and builds its own isolated span hierarchy.
+
+Use the re-exported opentelemetry modules to access functionality such as `sdk` and `otlp`:
 
 ```rust
 use opentelemetry_traceable::opentelemetry::trace::TracerProvider as _;
 use opentelemetry_traceable::instrumentation::Instrumentation;
+use opentelemetry_traceable::opentelemetry_otlp::{self, WithExportConfig};
+use opentelemetry_traceable::opentelemetry_sdk;
 
-let provider = /* your own opentelemetry_sdk::trace::SdkTracerProvider */;
+let exporter = opentelemetry_otlp::SpanExporterBuilder::default()
+    .with_http()
+    .with_endpoint("http://localhost:4317")
+    .build()
+    .unwrap();
+let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+    .with_simple_exporter(exporter)
+    .build();
 
 let instr = Instrumentation::builder()
     .name("checkout-debug")                     // diagnostic only
@@ -42,7 +53,7 @@ instr.set_enabled(&["my_crate::checkout::*"])?; // keys and/or globs — see "Se
 
 `opentelemetry` is re-exported as `opentelemetry_traceable::opentelemetry` rather than being a
 dependency you add yourself: `#[traceable]`'s expansion and `Instrumentation::tracer`/`Context`/
-`KeyValue` all need to resolve to the *exact same* `opentelemetry` this crate was built against,
+`KeyValue` all need to resolve to the _exact same_ `opentelemetry` this crate was built against,
 and re-exporting it makes that structurally guaranteed instead of something you have to keep
 your own `Cargo.toml` in sync with. `linkme` gets the same treatment, hidden, since the macro is
 its only caller. Whatever `Tracer` implementation you build `provider` from (`opentelemetry_sdk`
@@ -58,7 +69,7 @@ active instrumentation and attaches a single context for the wrapped call (attac
 `FutureExt::with_context` across `.await` for async), so in-process parent/child nesting is
 automatic, including across `.await` points.
 
-Disabling a function only skips *its own* span — an enabled function still nests under the nearest
+Disabling a function only skips _its own_ span — an enabled function still nests under the nearest
 recording ancestor span **of the same instrumentation**, whether or not everything in between is
 enabled.
 
@@ -138,7 +149,7 @@ down and rebuilt whenever its identity (tracer, endpoint) changes. `build()` ret
 
 Slot reuse leaves one narrow, accepted race: `Drop` clears its bit across many sites
 non-atomically, and a traced call reads a site's mask before reading the slot table. A thread
-descheduled between those two reads, across an *entire* drop and rebuild, could find the new
+descheduled between those two reads, across an _entire_ drop and rebuild, could find the new
 occupant's tracer behind a bit the old occupant set and emit one span into the wrong
 instrumentation. Closing it properly would need epoch-based reclamation plus hot-path validation;
 the cost of losing the race is a single mis-attributed span during a reload, which isn't worth that
@@ -159,18 +170,18 @@ dropped deliberately as a consequence:
 - **Outbound requests carry no `traceparent` from opentelemetry-traceable**, since propagators inject whatever is in
   that same span slot.
 
-An instrumentation's spans nest only under other `#[traceable]` spans of that *same*
+An instrumentation's spans nest only under other `#[traceable]` spans of that _same_
 instrumentation. In-process nesting, including across `.await`, works correctly.
 
 ## Avoiding orphan spans for functions shared across call paths
 
-A function's enabled bit is per-instrumentation but not per-call-site: it fires for *every* caller,
+A function's enabled bit is per-instrumentation but not per-call-site: it fires for _every_ caller,
 not just the one you had in mind. That's fine for a function with one call site, but a function
 shared across multiple call paths (a common `db`/`cache`/logging-style helper called from several
-different flows) will also fire — as a disconnected root span — every time some *other*, non-traced
+different flows) will also fire — as a disconnected root span — every time some _other_, non-traced
 path calls it, since there's nothing above it in that instrumentation's hierarchy to attach to.
 
-The fix is *child-only mode*: for a given instrumentation, a function in this mode only creates a
+The fix is _child-only mode_: for a given instrumentation, a function in this mode only creates a
 span when that instrumentation already has a recording span on the current call path — never a
 root, even when enabled.
 
@@ -179,15 +190,15 @@ instr.set_child_only(&["my_crate::db::*"])?; // same selectors as the enabled se
 ```
 
 Child-only is orthogonal to enabled, and scoped to one instrumentation: a function must be enabled
-for that instrumentation to trace at all, and being child-only *for that instrumentation*
+for that instrumentation to trace at all, and being child-only _for that instrumentation_
 additionally suppresses it when it would otherwise root. The same function can be child-only for
 one instrumentation and root-capable for another.
 
 Crucially it's **not** a source annotation — it's set at runtime, because whether a shared helper
-*should* root a trace depends on what you're tracing. Tracing the flow that calls it? Put it in
-child-only mode so it stays nested and never orphans on the *other* flows. Tracing the helper's own
+_should_ root a trace depends on what you're tracing. Tracing the flow that calls it? Put it in
+child-only mode so it stays nested and never orphans on the _other_ flows. Tracing the helper's own
 subsystem (e.g. "trace the database")? Leave it root-capable so it still produces a trace even when
-its immediate caller isn't traced. It only changes *when* a span is created, not whether — still
+its immediate caller isn't traced. It only changes _when_ a span is created, not whether — still
 zero false negatives on the path you enabled, still the same near-zero cost when off.
 
 Deciding which functions to put in child-only mode for a given request is mechanical given a
@@ -243,7 +254,7 @@ everything" is an empty selector list.
 Earlier versions configured through a compact encoded string of numeric ids. That was dropped
 because ids were silently invalidated by the most likely edit there is: adding or removing a
 `#[traceable]` function renumbered every id after it, and a stale string still decoded to valid ids
-now pointing at the *wrong* functions, with nothing reported. A wrong key matches nothing and gets
+now pointing at the _wrong_ functions, with nothing reported. A wrong key matches nothing and gets
 named in an error. See [`docs/multi-instrumentation.md`](docs/multi-instrumentation.md) —
 "History: the ids this replaced" — for the full record, including the two id schemes that came
 before and what they cost.
@@ -254,7 +265,7 @@ This is the intended workflow when the thing picking which functions to trace ha
 isn't running Rust, or is choosing from thousands of candidates:
 
 1. **Dump the keys.** From within your instrumented application (an admin endpoint, a debug CLI
-   flag, a one-off example — `opentelemetry-traceable` has no way to know how *your* app wants to
+   flag, a one-off example — `opentelemetry-traceable` has no way to know how _your_ app wants to
    expose this, so it just provides the data):
    ```rust
    for key in opentelemetry_traceable::registry::keys() {
@@ -266,7 +277,7 @@ isn't running Rust, or is choosing from thousands of candidates:
    kafka.fetch
    my_crate::process
    ```
-   This is the *node* list. Call-graph edges aren't known to the running binary — the consumer
+   This is the _node_ list. Call-graph edges aren't known to the running binary — the consumer
    derives them from your source, and they're what decide which functions can root a trace and
    which should be child-only so the hierarchy stays intact.
 2. **Hand that list to the consumer** (an LLM with access to your source, a script, an operator)
@@ -275,7 +286,7 @@ isn't running Rust, or is choosing from thousands of candidates:
    directly, so there's no encoding step and nothing for the consumer to run against your binary
    first: `instr.set_enabled(&chosen_keys)?`.
 
-Because keys are the identity, the consumer's output *is* the configuration: it can write the keys
+Because keys are the identity, the consumer's output _is_ the configuration: it can write the keys
 straight into a config file, and a glob lets it express "the whole `db` module" as one line rather
 than enumerating it. A flow-shaped request — an entry point plus its transitive callees — still needs
 the explicit list, since a flow isn't a module.
@@ -319,16 +330,16 @@ iterations) through a plain function, through `#[traceable]` with nothing tracin
 no-op tracers), and through `#[tracing::instrument]` for comparison. Run with
 `cargo bench -p opentelemetry-traceable`. Representative local numbers:
 
-| variant                          | time      |
-| -------------------------------- | --------- |
-| `no_macro`                       | 862 ns    |
-| `traceable_disa` (mask == 0)     | 862 ns    |
-| `traceable_one_instr_enab`       | 1.245 µs  |
-| `traceable_one_instr_disa`       | 871 ns    |
-| `traceable_two_instr_enab`       | 1.488 µs  |
-| `traceable_two_instr_disa`       | 871 ns    |
-| `tracing_instrument_disa`        | 931 ns    |
-| `tracing_instrument_enab`        | 1.919 µs  |
+| variant                      | time     |
+| ---------------------------- | -------- |
+| `no_macro`                   | 862 ns   |
+| `traceable_disa` (mask == 0) | 862 ns   |
+| `traceable_one_instr_enab`   | 1.245 µs |
+| `traceable_one_instr_disa`   | 871 ns   |
+| `traceable_two_instr_enab`   | 1.488 µs |
+| `traceable_two_instr_disa`   | 871 ns   |
+| `tracing_instrument_disa`    | 931 ns   |
+| `tracing_instrument_enab`    | 1.919 µs |
 
 With no instrumentation tracing a function, `#[traceable]` costs the same as no macro at all,
 within noise — the mask is `0` and the macro dispatch is a single atomic load followed by the raw

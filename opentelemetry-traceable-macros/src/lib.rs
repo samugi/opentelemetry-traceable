@@ -7,6 +7,10 @@
 //! and per instrumentation -- at runtime without recompiling. There is no
 //! `tracer` argument: each instrumentation brings its own tracer, so a call site
 //! has nothing to name.
+//!
+//! Important: expanded macros only depend on `opentelemetry` via the
+//! re-exported ::opentelemetry_traceable::opentelemetry namespace.
+//! Additional dependencies need to be handled appropriately by adapting manifest files.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;

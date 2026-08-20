@@ -24,6 +24,12 @@ pub use opentelemetry_traceable_macros::traceable;
 /// `opentelemetry` than this crate was built against.
 pub use opentelemetry;
 
+#[cfg(feature = "sdk")]
+pub use opentelemetry_sdk;
+
+#[cfg(feature = "otlp")]
+pub use opentelemetry_otlp;
+
 #[doc(hidden)]
 pub mod __private {
     pub use linkme;
