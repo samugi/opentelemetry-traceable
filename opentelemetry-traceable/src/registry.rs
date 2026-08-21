@@ -26,24 +26,14 @@ pub struct TraceSite {
     /// load of this word compared against zero, so a function no instrumentation
     /// cares about costs one atomic load.
     pub enabled_mask: AtomicU64,
-    /// Bitmask of which instrumentation slots have this function in
-    /// *child-only* mode: for a slot whose bit is set here, this function only
-    /// creates a span when called from within an already-recording span for
-    /// that same slot -- never as a root, even when enabled. Set at runtime
-    /// (not a source annotation): whether a shared function should be allowed
-    /// to root a trace is request-relative, so it's decided when tracing is
-    /// configured, avoiding orphan root spans on call paths that aren't traced.
-    pub child_only_mask: AtomicU64,
 }
 
 impl TraceSite {
-    /// Creates a new registry entry for `name`, with every slot disabled and
-    /// root-capable (both masks start at zero).
+    /// Creates a new registry entry for `name`, with every slot disabled.
     pub const fn new(name: &'static str) -> Self {
         Self {
             name,
             enabled_mask: AtomicU64::new(0),
-            child_only_mask: AtomicU64::new(0),
         }
     }
 }

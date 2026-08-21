@@ -46,7 +46,7 @@ let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
 let instr = Instrumentation::builder()
     .name("checkout-debug")                     // diagnostic only
     .tracer(provider.tracer("checkout-debug"))  // any opentelemetry Tracer; required
-    .build()?;                                  // Err(SlotsExhausted) if 64 are already live
+    .build()?;                                  // Err(BuildError) if no slot is free
 
 instr.set_enabled(&["my_crate::checkout::*"])?; // keys and/or globs — see "Selecting functions"
 ```
@@ -66,8 +66,13 @@ Every `#[traceable]` function is disabled for every instrumentation by default. 
 instrumentation is tracing a function, a call costs a single atomic load — no span, no
 `opentelemetry::Context` work at all. When at least one is, the macro builds one child span per
 active instrumentation and attaches a single context for the wrapped call (attach/detach for sync,
-`FutureExt::with_context` across `.await` for async), so in-process parent/child nesting is
-automatic, including across `.await` points.
+`FutureExt::with_context` across `.await` for async), so parent/child nesting is automatic,
+including across `.await` points.
+
+An instrumentation is **in-process** by default: its spans nest under each other and nowhere else.
+Add `.distributed()` to the builder for one that joins an incoming `traceparent` and is carried
+outbound by a propagator — see
+[In-process and distributed instrumentations](#in-process-and-distributed-instrumentations).
 
 Disabling a function only skips _its own_ span — an enabled function still nests under the nearest
 recording ancestor span **of the same instrumentation**, whether or not everything in between is
@@ -95,19 +100,15 @@ instr.disable(&["my_crate::db::*"])?;          // subtractive
 instr.enable_all();                            // every registered function
 instr.disable_all();                           // none
 
-instr.set_child_only(&["my_crate::db::*"])?;   // replace the child-only set
-
 instr.enabled_names();                         // -> impl Iterator<Item = &'static str>, read-only
-instr.child_only_names();                      // -> impl Iterator<Item = &'static str>, read-only
 
 opentelemetry_traceable::registry::keys();     // -> every registered key, regardless of instrumentation
 ```
 
-All four setters take a slice of selectors and return `Result<Selection, UnknownKeys>` — see
-[Selecting functions by key](#selecting-functions-by-key). `enabled_names` / `child_only_names` are
-introspection only, and both are sorted. `keys()` lives on the registry rather than on a handle,
-because the set of linked `#[traceable]` functions is a property of the binary, not of any one
-instrumentation.
+All three setters take a slice of selectors and return `Result<Selection, UnknownKeys>` — see
+[Selecting functions by key](#selecting-functions-by-key). `enabled_names` is introspection only,
+and sorted. `keys()` lives on the registry rather than on a handle, because the set of linked
+`#[traceable]` functions is a property of the binary, not of any one instrumentation.
 
 A key list scales through globs rather than through compression: selecting a module is one selector
 no matter how large the registry is, and unlike a fixed list it keeps covering functions added to
@@ -120,7 +121,7 @@ this is a config file rather than a wire format. (Earlier versions did compress:
 
 There's exactly one mechanism, so "several instrumentations in parallel" is just the general case of
 what's above rather than a separate feature. Create as many as you need — each with its own enabled
-subset, its own child-only set, and its own `Tracer` (potentially a different backend):
+subset and its own `Tracer` (potentially a different backend):
 
 ```rust
 let checkout = Instrumentation::builder()
@@ -145,7 +146,7 @@ instrumentation is actually active.
 over the process lifetime: each handle owns one bit per `#[traceable]` site, and `Drop` releases
 its slot to a free list for reuse. That matters for hot-reload, where an instrumentation is torn
 down and rebuilt whenever its identity (tracer, endpoint) changes. `build()` returns
-`Err(SlotsExhausted)` only when 64 are concurrently live.
+`Err(BuildError::SlotsExhausted)` only when 64 are concurrently live.
 
 Slot reuse leaves one narrow, accepted race: `Drop` clears its bit across many sites
 non-atomically, and a traced call reads a site's mask before reading the slot table. A thread
@@ -155,56 +156,65 @@ instrumentation. Closing it properly would need epoch-based reclamation plus hot
 the cost of losing the race is a single mis-attributed span during a reload, which isn't worth that
 machinery. See [`docs/multi-instrumentation.md`](docs/multi-instrumentation.md) for the design.
 
-## Limitation: in-process only
+## In-process and distributed instrumentations
 
-Instrumentations never read or write `opentelemetry::Context`'s single "current span" slot — their
-spans live exclusively in a `Context` extension envelope, one entry per active slot, so async
-propagation stays O(1) no matter how many instrumentations are live. Distributed propagation is
-dropped deliberately as a consequence:
+An instrumentation is one of two kinds. They are configured identically — same selectors, same
+handle — and differ only in where a span finds its parent and where it leaves itself.
+
+### In-process (the default)
+
+Parents live in an `opentelemetry::Context` extension, one entry per live instrumentation, and
+`Context`'s single "current span" slot is never read or written. That is what lets many run at
+once over the same call flow, and it is also why they cannot propagate:
 
 - **An incoming `traceparent` is not joined.** A propagator deposits the remote parent in
-  `Context`'s span slot, which no instrumentation consults, so the first traced function on a call
-  path always roots a fresh trace.
-- **A span created outside opentelemetry-traceable is never a parent** either — not a web framework's server span,
-  not a hand-rolled `tracer.start()`.
-- **Outbound requests carry no `traceparent` from opentelemetry-traceable**, since propagators inject whatever is in
-  that same span slot.
+  `Context`'s span slot, which an in-process instrumentation never consults, so the first traced
+  function on a call path always roots a fresh trace.
+- **A span created outside opentelemetry-traceable is never a parent** either — not a web
+  framework's server span, not a hand-rolled `tracer.start()`.
+- **Outbound requests carry no `traceparent`**, since propagators inject whatever is in that same
+  span slot.
 
-An instrumentation's spans nest only under other `#[traceable]` spans of that _same_
+An in-process instrumentation's spans nest only under other `#[traceable]` spans of that _same_
 instrumentation. In-process nesting, including across `.await`, works correctly.
 
-## Avoiding orphan spans for functions shared across call paths
-
-A function's enabled bit is per-instrumentation but not per-call-site: it fires for _every_ caller,
-not just the one you had in mind. That's fine for a function with one call site, but a function
-shared across multiple call paths (a common `db`/`cache`/logging-style helper called from several
-different flows) will also fire — as a disconnected root span — every time some _other_, non-traced
-path calls it, since there's nothing above it in that instrumentation's hierarchy to attach to.
-
-The fix is _child-only mode_: for a given instrumentation, a function in this mode only creates a
-span when that instrumentation already has a recording span on the current call path — never a
-root, even when enabled.
+### Distributed (at most one)
 
 ```rust
-instr.set_child_only(&["my_crate::db::*"])?; // same selectors as the enabled set
+let edge = Instrumentation::builder()
+    .name("edge")
+    .tracer(provider.tracer("edge"))
+    .distributed()          // <- the only difference
+    .build()?;
 ```
 
-Child-only is orthogonal to enabled, and scoped to one instrumentation: a function must be enabled
-for that instrumentation to trace at all, and being child-only _for that instrumentation_
-additionally suppresses it when it would otherwise root. The same function can be child-only for
-one instrumentation and root-capable for another.
+A distributed instrumentation uses `Context`'s current-span slot instead of the envelope. Its span
+parents to whatever span is current — one a propagator extracted from an incoming `traceparent`,
+one another library created, or its own previous span — and becomes the current span for the
+wrapped call, so a propagator injecting from `Context::current()` inside that call carries it
+outbound.
 
-Crucially it's **not** a source annotation — it's set at runtime, because whether a shared helper
-_should_ root a trace depends on what you're tracing. Tracing the flow that calls it? Put it in
-child-only mode so it stays nested and never orphans on the _other_ flows. Tracing the helper's own
-subsystem (e.g. "trace the database")? Leave it root-capable so it still produces a trace even when
-its immediate caller isn't traced. It only changes _when_ a span is created, not whether — still
-zero false negatives on the path you enabled, still the same near-zero cost when off.
+Propagation therefore works in both directions with **no propagator code in this crate**: your
+application extracts and injects exactly as it already does, and `#[traceable]` spans join the
+trace like any other spans.
 
-Deciding which functions to put in child-only mode for a given request is mechanical given a
-call graph: a function should be child-only exactly when one of its own callers is also being
-traced (so it always has a parent), and root-capable otherwise. That's the rule the agent
-workflow below applies.
+Two consequences worth knowing before you turn one on:
+
+- **It is visible to everything else.** Anything reading `Context::current().span()` —
+  `tracing-opentelemetry`, an instrumented HTTP client, your own code — now sees these spans and
+  nests under them. This is the point, but it is the one way this crate stops being invisible.
+- **One logical trace, possibly two backends.** If the distributed instrumentation's tracer comes
+  from a different provider than the rest of your app's, the trace's spans are split across two
+  exporters. Legal in OpenTelemetry, surprising in a UI.
+
+**Only one may be live at a time.** There is exactly one current-span slot per `Context`, so a
+second distributed instrumentation would overwrite the first's span and silently merge two traces.
+`build()` refuses with `Err(BuildError::DistributedAlreadyLive)`; dropping the live one releases
+the role along with its slot. In-process instrumentations are unaffected — a distributed one takes
+an ordinary slot, so the budget is 63 in-process plus 1 distributed.
+
+The two kinds are fully isolated from each other: a distributed span never parents an in-process
+one, or the other way round.
 
 ## Selecting functions by key
 
@@ -277,9 +287,9 @@ isn't running Rust, or is choosing from thousands of candidates:
    kafka.fetch
    my_crate::process
    ```
-   This is the _node_ list. Call-graph edges aren't known to the running binary — the consumer
-   derives them from your source, and they're what decide which functions can root a trace and
-   which should be child-only so the hierarchy stays intact.
+   This is the _node_ list. Call-graph edges aren't known to the running binary — if the consumer
+   needs them (to pick an entry point plus its transitive callees, say) it derives them from your
+   source.
 2. **Hand that list to the consumer** (an LLM with access to your source, a script, an operator)
    along with the task: "pick whichever of these functions should be traced."
 3. **Apply the picks** to the instrumentation that should trace that subset — the keys go in
@@ -306,9 +316,9 @@ this whole README.
 - `agents/SKILL.md` → copy to the application repo as a manually-invoked Claude Code skill, e.g.
   `.claude/skills/configure-tracing/SKILL.md`.
 
-Both drive the application's own key-listing entry point, read its source to derive the call graph,
-then apply the child-only rule above so the resulting hierarchy holds together. They expect the app
-to expose that entry point and ask the user if it doesn't.
+Both drive the application's own key-listing entry point and read its source to derive the call
+graph, so the selected set holds together as a hierarchy. They expect the app to expose that entry
+point and ask the user if it doesn't.
 See `opentelemetry-traceable-demo/AGENTS.md` and `opentelemetry-traceable-demo/.claude/skills/configure-tracing/SKILL.md` for a
 working copy.
 
@@ -316,7 +326,7 @@ working copy.
 
 - `opentelemetry-traceable` — runtime: `#[traceable]` re-export, an `opentelemetry` re-export
   (so consumers never declare it themselves — see Quick start), `registry` (the
-  `linkme`-collected `TraceSite`/`REGISTRY`, one enabled/child-only bitmask pair per site),
+  `linkme`-collected `TraceSite`/`REGISTRY`, one enabled bitmask per site),
   `instrumentation` (`Instrumentation` + its builder — creating, configuring, and dropping
   instrumentations, plus the `start_spans` hot path), `selector` (key/glob matching and
   `resolve`).

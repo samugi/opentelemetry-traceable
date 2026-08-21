@@ -10,12 +10,16 @@
 //! it. Hence `cargo nextest run` (process-per-test), enforced by
 //! `check_test_runner.rs`.
 
+use std::collections::HashMap;
+
 use opentelemetry::Context;
+use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::{
     SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TracerProvider as _,
 };
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
-use opentelemetry_traceable::instrumentation::Instrumentation;
+use opentelemetry_traceable::instrumentation::{BuildError, Instrumentation};
 use opentelemetry_traceable::traceable;
 
 /// Build an instrumentation with its own in-memory exporter/provider. The
@@ -32,6 +36,37 @@ fn instr(name: &'static str) -> (Instrumentation, InMemorySpanExporter) {
         .build()
         .expect("a free instrumentation slot");
     (instr, exporter)
+}
+
+/// As [`instr`], but the *distributed* kind: it parents to whatever span is
+/// current and leaves its own span there. At most one may be live at a time.
+fn distributed_instr(name: &'static str) -> (Instrumentation, InMemorySpanExporter) {
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let instr = Instrumentation::builder()
+        .name(name)
+        .tracer(provider.tracer(name))
+        .distributed()
+        .build()
+        .expect("a free instrumentation slot and no other distributed instrumentation");
+    (instr, exporter)
+}
+
+/// A valid remote span context, standing in for what a propagator extracts from
+/// an incoming `traceparent` -- or for a web framework's own server span.
+fn remote_parent() -> SpanContext {
+    SpanContext::new(
+        TraceId::from_bytes([
+            0x0b, 0xad, 0xc0, 0xde, 0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+            0x07, 0x08,
+        ]),
+        SpanId::from_bytes([0, 0, 0, 0, 0, 0, 0, 0x42]),
+        TraceFlags::SAMPLED,
+        true,
+        Default::default(),
+    )
 }
 
 /// This instrumentation's enabled keys, sorted -- `enabled_names` promises that
@@ -91,10 +126,20 @@ async fn shared_async_leaf() -> u64 {
 }
 
 /// Reports whether the ambient `Context`'s own span slot holds a valid span --
-/// used to prove instrumentations never write into it.
+/// used to prove which kind writes into it.
 #[traceable(name = "probe::ambient")]
 fn probe_ambient() -> bool {
     Context::current().span().span_context().is_valid()
+}
+
+/// Injects the ambient context into a carrier the way an outbound HTTP client
+/// would, from inside a traced body. This is the real propagation contract:
+/// a propagator only ever sees `Context`'s span slot.
+#[traceable(name = "probe::inject")]
+fn probe_inject() -> HashMap<String, String> {
+    let mut carrier = HashMap::new();
+    TraceContextPropagator::new().inject_context(&Context::current(), &mut carrier);
+    carrier
 }
 
 struct Widget;
@@ -580,43 +625,47 @@ fn keys_are_the_sorted_deduped_registry_keys() {
     );
 }
 
-// --- In-process only: `Context`'s span slot is never read or written ---------
+// --- In-process kind: `Context`'s span slot is never read or written --------
 
 #[test]
-fn spans_never_land_in_the_ambient_context_span_slot() {
+fn in_process_spans_never_land_in_the_ambient_context_span_slot() {
     let (instr, exporter) = instr("A");
     instr.enable(&["probe::ambient"]).unwrap();
 
     // The probe reports what it sees in `Context::current().span()` from inside
     // its own traced body. A span *was* created for it (asserted below), but it
     // lives in the extension envelope, so the span slot stays empty -- which is
-    // exactly why outbound `traceparent` injection carries nothing from opentelemetry-traceable.
+    // exactly why outbound `traceparent` injection carries nothing from an
+    // in-process instrumentation.
     let saw_ambient_span = probe_ambient();
 
     assert!(
         !saw_ambient_span,
-        "an instrumentation's span must not occupy Context's span slot"
+        "an in-process span must not occupy Context's span slot"
     );
     assert_eq!(exporter.get_finished_spans().unwrap().len(), 1);
 }
 
 #[test]
-fn does_not_join_an_ambient_incoming_parent() {
+fn in_process_spans_are_not_injected_into_an_outbound_carrier() {
+    let (instr, exporter) = instr("A");
+    instr.enable(&["probe::inject"]).unwrap();
+
+    let carrier = probe_inject();
+
+    assert_eq!(exporter.get_finished_spans().unwrap().len(), 1);
+    assert!(
+        !carrier.contains_key("traceparent"),
+        "a propagator reads Context's span slot, which an in-process span never occupies"
+    );
+}
+
+#[test]
+fn in_process_does_not_join_an_ambient_incoming_parent() {
     let (instr, exporter) = instr("A");
     instr.enable(&["nesting::parent"]).unwrap();
 
-    // Stands in for a propagator-extracted incoming `traceparent`, or a web
-    // framework's server span: a valid span context in the ambient span slot.
-    let remote = SpanContext::new(
-        TraceId::from_bytes([
-            0x0b, 0xad, 0xc0, 0xde, 0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
-            0x07, 0x08,
-        ]),
-        SpanId::from_bytes([0, 0, 0, 0, 0, 0, 0, 0x42]),
-        TraceFlags::SAMPLED,
-        true,
-        Default::default(),
-    );
+    let remote = remote_parent();
     let guard = Context::current()
         .with_remote_span_context(remote.clone())
         .attach();
@@ -629,7 +678,7 @@ fn does_not_join_an_ambient_incoming_parent() {
     assert_ne!(
         spans[0].span_context.trace_id(),
         remote.trace_id(),
-        "instrumentations root their own trace rather than joining the ambient one"
+        "an in-process instrumentation roots its own trace rather than joining the ambient one"
     );
     assert_eq!(
         spans[0].parent_span_id,
@@ -638,119 +687,210 @@ fn does_not_join_an_ambient_incoming_parent() {
     );
 }
 
-// --- Child-only mode -------------------------------------------------------
+// --- Distributed kind: `Context`'s span slot is the parent and the output ----
 
 #[test]
-fn child_only_creates_no_span_without_an_active_parent() {
-    let (instr, exporter) = instr("A");
-    // Enabled AND put in child-only mode, but called directly with no active
-    // parent for this instrumentation -- must stay silent, not orphan a root.
-    instr.enable(&["shared::leaf"]).unwrap();
-    instr.set_child_only(&["shared::leaf"]).unwrap();
+fn distributed_joins_an_incoming_remote_parent() {
+    let (instr, exporter) = distributed_instr("edge");
+    instr.enable(&["nesting::parent"]).unwrap();
+    assert!(instr.is_distributed());
 
-    let result = shared_leaf();
+    // Stands in for a propagator-extracted incoming `traceparent`, or a web
+    // framework's server span: a valid span context in the ambient span slot.
+    let remote = remote_parent();
+    let guard = Context::current()
+        .with_remote_span_context(remote.clone())
+        .attach();
 
-    assert_eq!(result, 5);
-    assert!(exporter.get_finished_spans().unwrap().is_empty());
+    let _ = parent();
+    drop(guard);
+
+    let spans = exporter.get_finished_spans().unwrap();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        spans[0].span_context.trace_id(),
+        remote.trace_id(),
+        "a distributed instrumentation continues the incoming trace"
+    );
+    assert_eq!(
+        spans[0].parent_span_id,
+        remote.span_id(),
+        "and hangs off the incoming span"
+    );
 }
 
 #[test]
-fn child_only_nests_correctly_under_an_active_parent() {
-    let (instr, exporter) = instr("A");
-    instr.enable(&["shared::root", "shared::leaf"]).unwrap();
-    instr.set_child_only(&["shared::leaf"]).unwrap();
+fn distributed_span_becomes_the_ambient_current_span() {
+    let (instr, exporter) = distributed_instr("edge");
+    instr.enable(&["probe::ambient"]).unwrap();
 
-    let result = shared_root();
+    // The mirror of the in-process case above: the span goes *into* the slot a
+    // propagator injects from, which is what makes outbound propagation work.
+    let saw_ambient_span = probe_ambient();
 
-    assert_eq!(result, 5);
+    assert!(
+        saw_ambient_span,
+        "a distributed span must be the current span for the wrapped call"
+    );
+    assert_eq!(exporter.get_finished_spans().unwrap().len(), 1);
+}
+
+#[test]
+fn distributed_spans_are_injected_into_an_outbound_carrier() {
+    let (instr, exporter) = distributed_instr("edge");
+    instr.enable(&["probe::inject"]).unwrap();
+
+    let carrier = probe_inject();
+
+    let spans = exporter.get_finished_spans().unwrap();
+    assert_eq!(spans.len(), 1);
+    let traceparent = carrier
+        .get("traceparent")
+        .expect("a distributed span must be injected by an ordinary propagator");
+    // `00-<trace_id>-<span_id>-<flags>`: the downstream service continues *this*
+    // span, with no propagator code in this crate.
+    assert!(
+        traceparent.contains(&format!("{:032x}", spans[0].span_context.trace_id())),
+        "carried the wrong trace: {traceparent}"
+    );
+    assert!(
+        traceparent.contains(&format!("{:016x}", spans[0].span_context.span_id())),
+        "carried the wrong span: {traceparent}"
+    );
+}
+
+#[test]
+fn distributed_nests_through_the_ambient_span_slot() {
+    let (instr, exporter) = distributed_instr("edge");
+    instr
+        .enable(&["nesting::parent", "nesting::child"])
+        .unwrap();
+
+    assert_eq!(parent(), 7);
+
     let spans = exporter.get_finished_spans().unwrap();
     assert_eq!(spans.len(), 2);
-    let leaf_span = spans.iter().find(|s| s.name == "shared::leaf").unwrap();
-    let root_span = spans.iter().find(|s| s.name == "shared::root").unwrap();
-    assert_eq!(leaf_span.parent_span_id, root_span.span_context.span_id());
-}
-
-#[test]
-fn child_only_mode_still_respects_the_enabled_flag() {
-    let (instr, exporter) = instr("A");
-    // Root enabled, leaf's own flag left off -- child-only only relaxes the
-    // "needs a parent" requirement, it doesn't bypass the function's own
-    // enabled flag.
-    instr.enable(&["shared::root"]).unwrap();
-    instr.set_child_only(&["shared::leaf"]).unwrap();
-
-    let result = shared_root();
-
-    assert_eq!(result, 5);
-    let spans = exporter.get_finished_spans().unwrap();
-    assert_eq!(spans.len(), 1);
-    assert_eq!(spans[0].name, "shared::root");
-}
-
-#[test]
-fn child_only_is_a_runtime_mode_the_same_fn_can_root_or_not() {
-    // The same enabled function roots a trace when *not* in child-only mode,
-    // and stays silent (no orphan) when it *is* -- the whole point of making
-    // child-only a runtime decision rather than a source annotation.
-    let (instr, exporter) = instr("A");
-
-    // Not child-only: called directly, it roots its own span.
-    instr.enable(&["shared::leaf"]).unwrap();
-    assert_eq!(shared_leaf(), 5);
-    let spans = exporter.get_finished_spans().unwrap();
-    assert_eq!(spans.len(), 1);
-    assert_eq!(spans[0].name, "shared::leaf");
-
-    // Flip the same function into child-only mode: now it suppresses itself.
-    exporter.reset();
-    instr.set_child_only(&["shared::leaf"]).unwrap();
-    assert_eq!(shared_leaf(), 5);
-    assert!(exporter.get_finished_spans().unwrap().is_empty());
+    let child_span = spans.iter().find(|s| s.name == "nesting::child").unwrap();
+    let parent_span = spans.iter().find(|s| s.name == "nesting::parent").unwrap();
+    assert_eq!(
+        child_span.parent_span_id,
+        parent_span.span_context.span_id()
+    );
+    assert_eq!(
+        child_span.span_context.trace_id(),
+        parent_span.span_context.trace_id()
+    );
 }
 
 #[tokio::test]
-async fn child_only_works_for_async_functions_too() {
-    let (instr, exporter) = instr("A");
-
-    instr.enable(&["shared::async_leaf"]).unwrap();
-    instr.set_child_only(&["shared::async_leaf"]).unwrap();
-    let result = shared_async_leaf().await;
-    assert_eq!(result, 5);
-    assert!(
-        exporter.get_finished_spans().unwrap().is_empty(),
-        "async child-only fn must not orphan without an active parent"
-    );
-
+async fn distributed_nesting_survives_await_points() {
+    let (instr, exporter) = distributed_instr("edge");
     instr
         .enable(&["shared::async_root", "shared::async_leaf"])
         .unwrap();
-    let result = shared_async_root().await;
-    assert_eq!(result, 5);
+
+    assert_eq!(shared_async_root().await, 5);
+
     let spans = exporter.get_finished_spans().unwrap();
     assert_eq!(spans.len(), 2);
-    let leaf_span = spans
+    let leaf = spans
         .iter()
         .find(|s| s.name == "shared::async_leaf")
         .unwrap();
-    let root_span = spans
+    let root = spans
         .iter()
         .find(|s| s.name == "shared::async_root")
         .unwrap();
-    assert_eq!(leaf_span.parent_span_id, root_span.span_context.span_id());
+    assert_eq!(leaf.parent_span_id, root.span_context.span_id());
+    assert_eq!(leaf.span_context.trace_id(), root.span_context.trace_id());
 }
 
 #[test]
-fn child_only_names_reflects_the_configured_set() {
-    let (instr, _exporter) = instr("A");
+fn only_one_distributed_instrumentation_may_be_live() {
+    let (first, _exporter) = distributed_instr("edge");
 
-    instr
-        .set_child_only(&["shared::leaf", "shared::async_leaf"])
+    let second = Instrumentation::builder()
+        .name("second-edge")
+        .tracer(SdkTracerProvider::builder().build().tracer("second-edge"))
+        .distributed()
+        .build();
+
+    assert_eq!(
+        second.err(),
+        Some(BuildError::DistributedAlreadyLive),
+        "two of them would fight over Context's single span slot"
+    );
+    assert!(first.is_distributed());
+
+    // An in-process one is unaffected -- the limit is on the role, not on slots.
+    let (in_process, _exp) = instr("A");
+    assert!(!in_process.is_distributed());
+}
+
+#[test]
+fn dropping_a_distributed_instrumentation_releases_the_role() {
+    // Hot-reload rebuilds an instrumentation whenever its tracer or endpoint
+    // changes, so the role has to come back with the slot.
+    for _ in 0..3 {
+        let (instr, exporter) = distributed_instr("edge");
+        instr.enable(&["nesting::child"]).unwrap();
+        let _ = child();
+        assert_eq!(exporter.get_finished_spans().unwrap().len(), 1);
+        drop(instr);
+    }
+}
+
+#[test]
+fn a_distributed_and_an_in_process_instrumentation_stay_isolated() {
+    let (dist, exp_dist) = distributed_instr("edge");
+    let (local, exp_local) = instr("A");
+
+    dist.enable(&["nesting::parent", "nesting::child"]).unwrap();
+    local
+        .enable(&["nesting::parent", "nesting::child"])
         .unwrap();
-    let names: std::collections::HashSet<_> = instr.child_only_names().collect();
 
-    assert!(names.contains("shared::leaf"));
-    assert!(names.contains("shared::async_leaf"));
-    assert!(!names.contains("shared::root"));
+    // An incoming trace the distributed one must join and the in-process one
+    // must ignore.
+    let remote = remote_parent();
+    let guard = Context::current()
+        .with_remote_span_context(remote.clone())
+        .attach();
+    let _ = parent();
+    drop(guard);
+
+    let spans_dist = exp_dist.get_finished_spans().unwrap();
+    let spans_local = exp_local.get_finished_spans().unwrap();
+    assert_eq!(spans_dist.len(), 2);
+    assert_eq!(spans_local.len(), 2);
+
+    assert!(
+        spans_dist
+            .iter()
+            .all(|s| s.span_context.trace_id() == remote.trace_id()),
+        "the distributed instrumentation joins the incoming trace"
+    );
+    assert!(
+        spans_local
+            .iter()
+            .all(|s| s.span_context.trace_id() != remote.trace_id()),
+        "the in-process one is untouched by the distributed span in the ambient slot"
+    );
+
+    // The in-process child parents to the in-process parent, not to the
+    // distributed span that was current at the time.
+    let local_child = spans_local
+        .iter()
+        .find(|s| s.name == "nesting::child")
+        .unwrap();
+    let local_parent = spans_local
+        .iter()
+        .find(|s| s.name == "nesting::parent")
+        .unwrap();
+    assert_eq!(
+        local_child.parent_span_id,
+        local_parent.span_context.span_id()
+    );
 }
 
 // --- Multiple, independently-configured instrumentations -------------------
@@ -832,28 +972,6 @@ fn the_same_function_traced_by_two_instrumentations_yields_separate_traces() {
         sb[0].span_context.trace_id(),
         "each instrumentation builds a separate trace"
     );
-}
-
-#[test]
-fn child_only_is_per_instrumentation() {
-    let (a, exp_a) = instr("A");
-    let (b, exp_b) = instr("B");
-
-    // Both enable the shared leaf; A puts it in child-only mode, B leaves it
-    // root-capable. Called directly (no parent), A must suppress it, B must not.
-    a.enable(&["shared::leaf"]).unwrap();
-    a.set_child_only(&["shared::leaf"]).unwrap();
-    b.enable(&["shared::leaf"]).unwrap();
-
-    let _ = shared_leaf();
-
-    assert!(
-        exp_a.get_finished_spans().unwrap().is_empty(),
-        "A: child-only with no parent stays silent"
-    );
-    let sb = exp_b.get_finished_spans().unwrap();
-    assert_eq!(sb.len(), 1, "B: root-capable, so it roots its own span");
-    assert_eq!(sb[0].name, "shared::leaf");
 }
 
 #[test]

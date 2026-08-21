@@ -27,29 +27,33 @@
 //! The macro loads it once per call: `0` means nobody is tracing,
 //! and anything else routes through [`start_spans`], which builds one child span
 //! *per active slot* using that slot's own tracer and parent.
-//! The per-slot parents all live inside one `opentelemetry::Context` extension.
 //!
-//! There is exactly one context per thread, so the currently-active (per-slot)
-//! spans must share one propagation envelope.
+//! # Two kinds: in-process and distributed
 //!
-//! # Limitation: in-process only
+//! ## In-process (the default)
 //!
-//! Instrumentations never read or write `opentelemetry::Context`'s single
-//! "current span" slot: their spans live exclusively in that extension
-//! envelope. The consequences are:
+//! Every parent lives in one `opentelemetry::Context` extension, one entry per
+//! active slot. These instrumentations cannot interact with propagators, therefore
+//! their traces are contained in the current process (not distributed).
+//! There can be many in-process instrumentations configured at once.
 //!
-//! * An incoming `traceparent` is **not** joined. A propagator deposits the
-//!   remote parent in `Context`'s span slot, which no instrumentation consults,
-//!   so the first traced function on a call path always roots a fresh trace.
-//!   By the same token, a span created outside opentelemetry-traceable -- a web framework's
-//!   server span, a hand-rolled `tracer.start()` -- is never a parent either.
-//! * Outbound `traceparent` headers carry nothing from opentelemetry-traceable, since
-//!   propagators inject whatever is in that same span slot.
 //!
-//! An instrumentation's spans nest only under other `#[traceable]` spans of
-//! that same instrumentation.
+//! ## Distributed (at most one)
+//!
+//! [`InstrumentationBuilder::distributed`] uses the `Context` current-span
+//! slot instead of the multi-slot envelope. The "current" span becomes the parent
+//! of the new span.
+//! The parent can be from an incoming `traceparent` header, created by another library,
+//! or its own previously active span.
+//! The main advantage of a distributed instrumentation is that it is compatible with
+//! Context propagation. A propagator that injects from `Context::current()` results
+//! in the new span being parented under the propagated context, as expected. 
+//!
+//! There is exactly one current-span slot per `Context`, so at most one
+//! distributed instrumentation may be live. If a second one is generated,
+//! [`InstrumentationBuilder::build`] refuses it with [`BuildError::DistributedAlreadyLive`].
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use arc_swap::ArcSwap;
@@ -57,7 +61,7 @@ use opentelemetry::trace::{SpanBuilder, TraceContextExt, Tracer};
 use opentelemetry::{Context, KeyValue};
 use smallvec::SmallVec;
 
-use crate::registry::{REGISTRY, TraceSite};
+use crate::registry::REGISTRY;
 use crate::selector::{self, Selection, UnknownKeys};
 
 /// Number of [`Instrumentation`]s that can be live simultaneously -- one bit per
@@ -96,7 +100,7 @@ enum BitOp {
 /// Applies an already-resolved [`Selection`], so this can't fail: resolution --
 /// the only fallible half -- happened before any bit was touched, which is what
 /// makes a typo leave tracing state completely untouched.
-fn apply(selection: &Selection, field: impl Fn(&TraceSite) -> &AtomicU64, slot: u8, op: BitOp) {
+fn apply(selection: &Selection, slot: u8, op: BitOp) {
     let b = bit(slot);
     // One flat walk over the registry, matching on the key string. Two call sites
     // sharing a key both match it, so a key with several sites toggles all of them
@@ -106,29 +110,26 @@ fn apply(selection: &Selection, field: impl Fn(&TraceSite) -> &AtomicU64, slot: 
         let hit = selection.keys.binary_search(&site.name).is_ok();
         match (op, hit) {
             (BitOp::Replace | BitOp::Add, true) => {
-                field(site).fetch_or(b, Ordering::Relaxed);
+                site.enabled_mask.fetch_or(b, Ordering::Relaxed);
             }
             (BitOp::Replace, false) | (BitOp::Remove, true) => {
-                field(site).fetch_and(!b, Ordering::Relaxed);
+                site.enabled_mask.fetch_and(!b, Ordering::Relaxed);
             }
             (BitOp::Add, false) | (BitOp::Remove, false) => {}
         }
     }
 }
 
-/// The keys whose `field` mask has `slot`'s bit set.
+/// The keys enabled for `slot`.
 ///
 /// Sorted and deduped explicitly. There's no id order left to inherit, so without
 /// this the linker's arbitrary `REGISTRY` order would leak into what callers see;
 /// dedup because one key can carry several call sites but is one selectable thing.
-fn slot_names(
-    slot: u8,
-    field: impl Fn(&TraceSite) -> &AtomicU64,
-) -> impl Iterator<Item = &'static str> {
+fn slot_names(slot: u8) -> impl Iterator<Item = &'static str> {
     let b = bit(slot);
     let mut names: Vec<&'static str> = REGISTRY
         .iter()
-        .filter(|site| field(site).load(Ordering::Relaxed) & b != 0)
+        .filter(|site| site.enabled_mask.load(Ordering::Relaxed) & b != 0)
         .map(|site| site.name)
         .collect();
     names.sort_unstable();
@@ -160,8 +161,9 @@ where
     }
 }
 
-/// Everything the slot layer owns: which slot holds which tracer, and which slot
-/// numbers are in play. Both live here so every change is one [`ArcSwap`] publish.
+/// Everything the slot layer owns: which slot holds which tracer, which slot (if
+/// any) is the distributed one, and which slot numbers are in play. All of it
+/// lives here so every change is one [`ArcSwap`] publish.
 ///
 /// `next` bumps through `0..MAX_INSTRUMENTATIONS` for fresh slots, then `freed`
 /// is recycled. So the cap is on *concurrently live* instrumentations, not on how
@@ -175,6 +177,11 @@ where
 #[derive(Clone)]
 struct Slots {
     tracers: [Option<Arc<dyn DynTracer>>; MAX_INSTRUMENTATIONS as usize],
+    /// The slot held by the live distributed instrumentation, if there is one.
+    /// A distributed instrumentation is an ordinary slot plus this pointer: it is
+    /// enabled, disabled and dropped like any other, and only [`start_spans`]
+    /// treats its bit differently.
+    distributed: Option<u8>,
     next: u8,
     freed: Vec<u8>,
 }
@@ -183,6 +190,7 @@ impl Slots {
     fn empty() -> Self {
         Self {
             tracers: std::array::from_fn(|_| None),
+            distributed: None,
             next: 0,
             freed: Vec::new(),
         }
@@ -214,29 +222,33 @@ static SLOTS: LazyLock<ArcSwap<Slots>> = LazyLock::new(|| ArcSwap::from_pointee(
 static SLOTS_WRITE: Mutex<()> = Mutex::new(());
 
 /// Read-modify-publish the slot state under [`SLOTS_WRITE`]. `f` runs exactly
-/// once, so it may allocate; returning `None` abandons the change and publishes
-/// nothing.
+/// once, so it may allocate; returning `Err` abandons the change and publishes
+/// nothing, which is what keeps a rejected `build` from leaving a half-taken slot
+/// behind.
 ///
 /// Poisoning is tolerated rather than propagated: the guarded data lives in the
 /// `ArcSwap`, not in the mutex, so a writer that panicked left the last
 /// *published* snapshot intact and there is nothing to recover.
-fn update_slots<R>(f: impl FnOnce(&mut Slots) -> Option<R>) -> Option<R> {
+fn update_slots<T, E>(f: impl FnOnce(&mut Slots) -> Result<T, E>) -> Result<T, E> {
     let _guard = SLOTS_WRITE.lock().unwrap_or_else(|e| e.into_inner());
     let mut next = (**SLOTS.load()).clone();
     let out = f(&mut next)?;
     SLOTS.store(Arc::new(next));
-    Some(out)
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
 // The per-call multi-slot state carried inside `Context`.
 // ---------------------------------------------------------------------------
 
-/// The currently-active named slots' parent contexts, carried inside one
+/// The currently-active in-process slots' parent contexts, carried inside one
 /// `opentelemetry::Context` extension. Sparse: only slots active on this call
 /// path appear, so cloning it costs the active count, not the slot capacity.
+///
+/// The distributed slot is deliberately absent -- its parent is the ambient
+/// current span, which `Context` already carries.
 #[derive(Clone)]
-struct MultiInstrumentState(SmallVec<[(u8, Context); 4]>);
+struct InProcessParents(SmallVec<[(u8, Context); 4]>);
 
 fn span_builder(name: &'static str, attrs: &[KeyValue]) -> SpanBuilder {
     if attrs.is_empty() {
@@ -248,91 +260,114 @@ fn span_builder(name: &'static str, attrs: &[KeyValue]) -> SpanBuilder {
 
 /// Build one child span per active slot in `enabled_mask` and return the new
 /// `Context` to attach for the wrapped call, or `None` if no span was created --
-/// every active slot suppressed by child-only mode, or its instrumentation
-/// dropped mid-flight -- in which case the caller runs the body with no context
-/// machinery at all.
+/// every active slot's instrumentation was dropped mid-flight -- in which case
+/// the caller runs the body with no context machinery at all.
 ///
 /// Not part of the stable API -- called by the `#[traceable]` macro whenever the
 /// mask is non-zero.
 ///
-/// Every span goes into the [`MultiInstrumentState`] envelope; the ambient
-/// `Context`'s own span slot is neither read nor written, so a slot's parent is
-/// strictly its own previous span on this call path (see the module's
-/// in-process-only limitation).
+/// The distributed slot (at most one) parents to the ambient current span and
+/// leaves its own span there. Every other slot parents within the
+/// [`InProcessParents`] envelope and never touches that span slot, so a slot's
+/// parent is strictly its own previous span on this call path.
 #[doc(hidden)]
 pub fn start_spans(
     enabled_mask: u64,
-    child_only_mask: u64,
     span_name: &'static str,
     attrs: Vec<KeyValue>,
 ) -> Option<Context> {
-    let cur = Context::current();
-    let mut env: SmallVec<[(u8, Context); 4]> = cur
-        .get::<MultiInstrumentState>()
-        .map(|s| s.0.clone())
-        .unwrap_or_default();
-
     // `load_full`, not `load`: an arc-swap guard held across span construction
     // would make `ArcSwap::store` -- i.e. a config reload -- wait on sampler and
     // exporter latency, and nested traced calls would exhaust arc-swap's small
     // per-thread borrow pool. An owned `Arc` costs one refcount bump and neither.
     let slots = SLOTS.load_full();
+    let mut cx = Context::current();
     let mut created_any = false;
 
-    let mut bits = enabled_mask;
-    while bits != 0 {
-        let slot = bits.trailing_zeros() as u8;
-        bits &= bits - 1;
-
-        let parent = env.iter().find(|(s, _)| *s == slot).map(|(_, c)| c);
-        // Child-only: only trace when this slot already has a recording span on
-        // this call path, so a shared helper never orphans a root span on the
-        // paths that aren't being traced.
-        if child_only_mask & bit(slot) != 0 && !parent.is_some_and(|c| c.span().is_recording()) {
-            continue;
-        }
-        let Some(tracer) = slots.tracers[slot as usize].as_ref() else {
-            // Instrumentation was dropped mid-flight; just skip its slot.
-            continue;
-        };
-        let base = parent.cloned().unwrap_or_default();
-        let child = tracer.start_in(span_builder(span_name, &attrs), &base);
-        match env.iter_mut().find(|(s, _)| *s == slot) {
-            Some(entry) => entry.1 = child,
-            None => env.push((slot, child)),
-        }
+    // The distributed slot, if it has this site enabled.
+    let distributed = slots
+        .distributed
+        .filter(|slot| enabled_mask & bit(*slot) != 0);
+    if let Some(tracer) = distributed.and_then(|slot| slots.tracers[slot as usize].as_ref()) {
+        // Parent is whatever span is current -- an extracted remote parent, another
+        // library's span, or this instrumentation's own previous span -- and the
+        // child lands back in that same slot, so outbound injection picks it up.
+        cx = tracer.start_in(span_builder(span_name, &attrs), &cx);
         created_any = true;
     }
 
-    if !created_any {
-        return None;
+    // Everything else is in-process: parented within the envelope, invisible to
+    // `Context`'s span slot. Skipped entirely when only the distributed slot is
+    // active, which spares a distributed-only setup the envelope clone.
+    let in_process_mask = enabled_mask & !distributed.map_or(0, bit);
+    if in_process_mask != 0 {
+        let mut env: SmallVec<[(u8, Context); 4]> = cx
+            .get::<InProcessParents>()
+            .map(|s| s.0.clone())
+            .unwrap_or_default();
+        let mut env_changed = false;
+
+        let mut bits = in_process_mask;
+        while bits != 0 {
+            let slot = bits.trailing_zeros() as u8;
+            bits &= bits - 1;
+
+            let Some(tracer) = slots.tracers[slot as usize].as_ref() else {
+                // Instrumentation was dropped mid-flight; just skip its slot.
+                continue;
+            };
+            let parent = env.iter().find(|(s, _)| *s == slot).map(|(_, c)| c);
+            let base = parent.cloned().unwrap_or_default();
+            let child = tracer.start_in(span_builder(span_name, &attrs), &base);
+            match env.iter_mut().find(|(s, _)| *s == slot) {
+                Some(entry) => entry.1 = child,
+                None => env.push((slot, child)),
+            }
+            env_changed = true;
+        }
+
+        if env_changed {
+            // One envelope carrying every active in-process slot's new tip.
+            cx = cx.with_value(InProcessParents(env));
+            created_any = true;
+        }
     }
 
-    // One physical context to attach for the whole call, carrying every active
-    // slot's new tip. Inserted straight onto `cur` (which we still own) rather
-    // than cloning it first -- `with_value` clones `entries` itself.
-    Some(cur.with_value(MultiInstrumentState(env)))
+    created_any.then_some(cx)
 }
 
 // ---------------------------------------------------------------------------
 // Public handle + builder.
 // ---------------------------------------------------------------------------
 
-/// Returned by [`InstrumentationBuilder::build`] when [`MAX_INSTRUMENTATIONS`]
-/// are already live. Dropping any of them frees its slot for reuse.
-#[derive(Debug)]
-pub struct SlotsExhausted;
+/// Why [`InstrumentationBuilder::build`] could not produce an [`Instrumentation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildError {
+    /// [`MAX_INSTRUMENTATIONS`] are already live. Dropping any of them frees its
+    /// slot for reuse.
+    SlotsExhausted,
+    /// A distributed instrumentation is already live, and there can only be one:
+    /// they share `Context`'s single current-span slot, so a second would
+    /// overwrite the first's span and merge the two traces. Dropping the live one
+    /// releases the role.
+    DistributedAlreadyLive,
+}
 
-impl std::fmt::Display for SlotsExhausted {
+impl std::fmt::Display for BuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "no free instrumentation slot ({MAX_INSTRUMENTATIONS} already live)"
-        )
+        match self {
+            Self::SlotsExhausted => write!(
+                f,
+                "no free instrumentation slot ({MAX_INSTRUMENTATIONS} already live)"
+            ),
+            Self::DistributedAlreadyLive => {
+                write!(f, "a distributed instrumentation is already live")
+            }
+        }
     }
 }
 
-impl std::error::Error for SlotsExhausted {}
+impl std::error::Error for BuildError {}
 
 /// A dynamically-created, independently-configured tracing instrumentation --
 /// the only way to enable tracing for a `#[traceable]` function.
@@ -350,6 +385,7 @@ pub struct Instrumentation {
 pub struct InstrumentationBuilder {
     name: Option<String>,
     tracer: Option<Arc<dyn DynTracer>>,
+    distributed: bool,
 }
 
 impl std::fmt::Debug for InstrumentationBuilder {
@@ -357,6 +393,7 @@ impl std::fmt::Debug for InstrumentationBuilder {
         f.debug_struct("InstrumentationBuilder")
             .field("name", &self.name)
             .field("tracer", &self.tracer.as_ref().map(|_| "<tracer>"))
+            .field("distributed", &self.distributed)
             .finish()
     }
 }
@@ -382,24 +419,49 @@ impl InstrumentationBuilder {
         self
     }
 
+    /// Make this a *distributed* instrumentation instead of the default
+    /// in-process one: its spans use `opentelemetry::Context`'s current-span
+    /// slot, so they join an incoming `traceparent`, nest under spans created by
+    /// other libraries, and are picked up by a propagator injecting outbound.
+    ///
+    /// At most one may be live at a time -- see [`BuildError::DistributedAlreadyLive`]
+    /// and the module docs.
+    #[must_use]
+    pub fn distributed(mut self) -> Self {
+        self.distributed = true;
+        self
+    }
+
     /// Allocate a slot and register the tracer, returning a live handle.
+    ///
+    /// # Errors
+    ///
+    /// [`BuildError::SlotsExhausted`] if [`MAX_INSTRUMENTATIONS`] are already
+    /// live, or [`BuildError::DistributedAlreadyLive`] if this is a distributed
+    /// instrumentation and one already exists. Either way nothing is allocated.
     ///
     /// # Panics
     ///
     /// Panics if no tracer was set via [`tracer`](Self::tracer).
-    pub fn build(self) -> Result<Instrumentation, SlotsExhausted> {
+    pub fn build(self) -> Result<Instrumentation, BuildError> {
         let tracer = self
             .tracer
             .expect("InstrumentationBuilder::build requires a tracer");
 
-        // One publish: the slot is taken and its tracer installed together, so any
-        // later `enable` on this slot is guaranteed to find the tracer.
+        // One publish: the slot is taken, its tracer installed and the distributed
+        // role claimed together, so any later `enable` on this slot is guaranteed
+        // to find the tracer, and two threads can't both claim the role.
         let slot = update_slots(|slots| {
-            let slot = slots.alloc()?;
+            if self.distributed && slots.distributed.is_some() {
+                return Err(BuildError::DistributedAlreadyLive);
+            }
+            let slot = slots.alloc().ok_or(BuildError::SlotsExhausted)?;
             slots.tracers[slot as usize] = Some(tracer);
-            Some(slot)
-        })
-        .ok_or(SlotsExhausted)?;
+            if self.distributed {
+                slots.distributed = Some(slot);
+            }
+            Ok(slot)
+        })?;
 
         Ok(Instrumentation { slot })
     }
@@ -410,6 +472,13 @@ impl Instrumentation {
     #[must_use]
     pub fn builder() -> InstrumentationBuilder {
         InstrumentationBuilder::default()
+    }
+
+    /// Whether this is the distributed instrumentation (see
+    /// [`InstrumentationBuilder::distributed`]).
+    #[must_use]
+    pub fn is_distributed(&self) -> bool {
+        SLOTS.load().distributed == Some(self.slot)
     }
 
     /// Enable every known `#[traceable]` function for this instrumentation.
@@ -445,7 +514,7 @@ impl Instrumentation {
     /// asked for.
     pub fn set_enabled<S: AsRef<str>>(&self, selectors: &[S]) -> Result<Selection, UnknownKeys> {
         let selection = selector::resolve(selectors)?;
-        apply(&selection, |s| &s.enabled_mask, self.slot, BitOp::Replace);
+        apply(&selection, self.slot, BitOp::Replace);
         Ok(selection)
     }
 
@@ -457,7 +526,7 @@ impl Instrumentation {
     /// As [`set_enabled`](Self::set_enabled).
     pub fn enable<S: AsRef<str>>(&self, selectors: &[S]) -> Result<Selection, UnknownKeys> {
         let selection = selector::resolve(selectors)?;
-        apply(&selection, |s| &s.enabled_mask, self.slot, BitOp::Add);
+        apply(&selection, self.slot, BitOp::Add);
         Ok(selection)
     }
 
@@ -469,63 +538,35 @@ impl Instrumentation {
     /// As [`set_enabled`](Self::set_enabled).
     pub fn disable<S: AsRef<str>>(&self, selectors: &[S]) -> Result<Selection, UnknownKeys> {
         let selection = selector::resolve(selectors)?;
-        apply(&selection, |s| &s.enabled_mask, self.slot, BitOp::Remove);
-        Ok(selection)
-    }
-
-    /// Replace this instrumentation's *child-only* set: exactly what `selectors`
-    /// resolves to is put in child-only mode for it, every other function made
-    /// root-capable again.
-    ///
-    /// A child-only function only produces a span when this instrumentation
-    /// already has a recording span on the current call path -- never as a root,
-    /// even when enabled. This is orthogonal to
-    /// [`set_enabled`](Self::set_enabled): a function must be enabled to trace at
-    /// all, and being child-only additionally suppresses it when it would
-    /// otherwise be a root. Whether a shared function should be child-only is
-    /// request-relative, so it's decided here rather than at the call site.
-    ///
-    /// # Errors
-    ///
-    /// As [`set_enabled`](Self::set_enabled).
-    pub fn set_child_only<S: AsRef<str>>(&self, selectors: &[S]) -> Result<Selection, UnknownKeys> {
-        let selection = selector::resolve(selectors)?;
-        apply(
-            &selection,
-            |s| &s.child_only_mask,
-            self.slot,
-            BitOp::Replace,
-        );
+        apply(&selection, self.slot, BitOp::Remove);
         Ok(selection)
     }
 
     /// Registry keys currently enabled for this instrumentation.
     pub fn enabled_names(&self) -> impl Iterator<Item = &'static str> {
-        slot_names(self.slot, |s| &s.enabled_mask)
-    }
-
-    /// Registry keys currently in child-only mode for this instrumentation.
-    pub fn child_only_names(&self) -> impl Iterator<Item = &'static str> {
-        slot_names(self.slot, |s| &s.child_only_mask)
+        slot_names(self.slot)
     }
 }
 
 impl Drop for Instrumentation {
     fn drop(&mut self) {
-        // Clear this slot's bits everywhere first (stops new spans), then drop
+        // Clear this slot's bit everywhere first (stops new spans), then drop
         // the tracer -- so no thread can see a set bit with a missing tracer.
         let b = bit(self.slot);
         for site in REGISTRY.iter() {
             site.enabled_mask.fetch_and(!b, Ordering::Relaxed);
-            site.child_only_mask.fetch_and(!b, Ordering::Relaxed);
         }
-        // One publish: the tracer is removed and the slot released together, so
-        // the next occupant can't be reached through this one's leftovers.
+        // One publish: the tracer is removed, the distributed role (if this held
+        // it) released and the slot freed together, so the next occupant can't be
+        // reached through this one's leftovers.
         let slot = self.slot;
-        update_slots(|slots| {
+        let _: Result<(), ()> = update_slots(|slots| {
             slots.tracers[slot as usize] = None;
+            if slots.distributed == Some(slot) {
+                slots.distributed = None;
+            }
             slots.freed.push(slot);
-            Some(())
+            Ok(())
         });
     }
 }

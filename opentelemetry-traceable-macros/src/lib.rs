@@ -121,11 +121,10 @@ impl Parse for TraceableArgs {
 /// async fn handle(id: String) { }
 /// ```
 ///
-/// Whether a function is allowed to root a trace or is *child-only* (only ever
-/// creates a span when its instrumentation already has a recording span on the
-/// current call path, never as a root) is not a source annotation — it's decided
-/// at runtime per instrumentation, since whether a shared function should root a
-/// trace depends on what's being traced.
+/// Where the span hangs is decided by the instrumentation, not here: an
+/// in-process one parents within its own hierarchy, a distributed one parents to
+/// whatever span is current (including one extracted from an incoming
+/// `traceparent`).
 #[proc_macro_attribute]
 pub fn traceable(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as TraceableArgs);
@@ -167,7 +166,8 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
 
     // `start_spans` builds one child span per active slot (with that slot's own
     // tracer and parent) and hands back the single context to attach, or `None`
-    // if every active slot was child-only-suppressed.
+    // if no span was created -- every active slot's instrumentation was dropped
+    // mid-flight.
     let traced = if is_async {
         quote! {
             ::opentelemetry_traceable::opentelemetry::trace::FutureExt::with_context(async #block, __traceable_cx).await
@@ -200,7 +200,6 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
             } else {
                 match ::opentelemetry_traceable::instrumentation::start_spans(
                     __traceable_mask,
-                    __TRACEABLE_SITE.child_only_mask.load(::std::sync::atomic::Ordering::Relaxed),
                     #span_name,
                     ::std::vec![#(#kvs),*],
                 ) {
