@@ -41,7 +41,7 @@ jobs:
 
       - name: Run clippy
         run: >-
-          cargo clippy --workspace --all-targets --all-features --
+          cargo clippy --locked --workspace --all-targets --all-features --
           -D warnings
           -W missing_debug_implementations
           -W missing_docs
@@ -59,7 +59,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Run rustdoc
-        run: cargo doc --workspace --keep-going --no-deps
+        run: cargo doc --locked --workspace --keep-going --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -79,7 +79,7 @@ jobs:
           install: true
 
       - name: Run cargo build
-        run: cargo build --workspace
+        run: cargo build --locked --workspace
 
       - name: Run cargo nextest (with mise)
         run: mise run test

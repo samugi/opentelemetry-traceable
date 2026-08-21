@@ -1,11 +1,14 @@
-//! Independently-configured tracing *instrumentations* over the same set of
-//! `#[traceable]` functions.
+//! An [`Instrumentation`] is an intance of a tracing configuration that defines
+//! which (of the traceable functions) are enabled for tracing. Each instrumentation
+//! maps to one tracer provider (and exporter), so that different exporting
+//! configuration can be assigned to different instrumentations.
 //!
-//! An [`Instrumentation`] is the only way to turn tracing on: there is no
-//! global or default instrumentation, and no process-wide tracer. Each one owns
-//! its enabled subset, its own isolated span hierarchy built from the same
-//! underlying call flow, and its own [`Tracer`] (potentially a different
-//! backend). Up to [`MAX_INSTRUMENTATIONS`] may be live at once.
+//! This allows producing multiple isolated traces that can be each exported using
+//! their specific configuration (endpoint, sampling strategy, etc).
+//!
+//! Every instrumentation takes up an available `slot`. There are a total of 64 slots
+//! available, therefore there is a maximum number of 64 instrumentations that can be
+//! configured at once.
 //!
 //! ```ignore
 //! let provider = /* some SdkTracerProvider */;
@@ -20,20 +23,20 @@
 //!
 //! # How isolation works
 //!
-//! Each `#[traceable]` site carries an enabled bitmask, one bit per slot.
-//! The macro loads it once per call: `0` means nobody is tracing (the
-//! single-atomic-load fast path), and anything else routes through
-//! [`start_spans`], which builds one child span *per active slot* using that
-//! slot's own tracer and parent. The per-slot parents ride together inside one
-//! `opentelemetry::Context` extension so async propagation stays O(1) -- there
-//! is exactly one ambient context per thread, so the currently-active per-slot
-//! spans must share one propagation envelope rather than N independent ones.
+//! Each `#[traceable]` site carries an "enabled" bitmask, one bit per slot.
+//! The macro loads it once per call: `0` means nobody is tracing,
+//! and anything else routes through [`start_spans`], which builds one child span
+//! *per active slot* using that slot's own tracer and parent.
+//! The per-slot parents all live inside one `opentelemetry::Context` extension.
+//!
+//! There is exactly one context per thread, so the currently-active (per-slot)
+//! spans must share one propagation envelope.
 //!
 //! # Limitation: in-process only
 //!
 //! Instrumentations never read or write `opentelemetry::Context`'s single
-//! "current span" slot -- their spans live exclusively in that extension
-//! envelope. Two consequences, both deliberate:
+//! "current span" slot: their spans live exclusively in that extension
+//! envelope. The consequences are:
 //!
 //! * An incoming `traceparent` is **not** joined. A propagator deposits the
 //!   remote parent in `Context`'s span slot, which no instrumentation consults,

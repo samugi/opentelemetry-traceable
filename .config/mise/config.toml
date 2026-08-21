@@ -3,11 +3,11 @@
 
 [tasks.test]
 description = "Run all tests using cargo-nextest"
-run = "cargo nextest run --workspace"
+run = "cargo nextest run --locked --workspace"
 
 [tasks.lint]
 description = "Run fmt and clippy checks"
 run = [
     "cargo fmt --all -- --check",
-    "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+    "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings",
 ]
