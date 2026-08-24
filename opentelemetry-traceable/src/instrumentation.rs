@@ -47,7 +47,7 @@
 //! or its own previously active span.
 //! The main advantage of a distributed instrumentation is that it is compatible with
 //! Context propagation. A propagator that injects from `Context::current()` results
-//! in the new span being parented under the propagated context, as expected. 
+//! in the new span being parented under the propagated context, as expected.
 //!
 //! There is exactly one current-span slot per `Context`, so at most one
 //! distributed instrumentation may be live. If a second one is generated,
@@ -64,48 +64,39 @@ use smallvec::SmallVec;
 use crate::registry::REGISTRY;
 use crate::selector::{self, Selection, UnknownKeys};
 
-/// Number of [`Instrumentation`]s that can be live simultaneously -- one bit per
-/// slot in each site's mask. Slots are released on `Drop` and reused, so
-/// this bounds concurrent instrumentations, not how many may be created over the
-/// process lifetime.
+/// Number of [`Instrumentation`]s that can be live *simultaneously*: one bit per
+/// slot in each site's mask.
 pub const MAX_INSTRUMENTATIONS: u32 = 64;
-
 const _: () = assert!(
     MAX_INSTRUMENTATIONS as usize == u64::BITS as usize,
     "MAX_INSTRUMENTATIONS must equal the number of bits in a site's mask"
 );
 
-// ---------------------------------------------------------------------------
-// Shared helpers for reading and writing one slot's bit across every site. Each
-// walks the full `REGISTRY` once -- meant to be called rarely (config/reload
-// events), never on a hot path.
-// ---------------------------------------------------------------------------
+// ========================================================================
+// Shared helpers for reading and writing one slot's bit across every site.
+// ========================================================================
 
 #[inline]
 fn bit(slot: u8) -> u64 {
     1u64 << slot
 }
 
-/// How a name/id match updates a slot's bit.
+/// How a name match updates a slot bit.
 #[derive(Clone, Copy)]
 enum BitOp {
-    /// Set the bit on matches, clear it on non-matches (whole-set replace).
+    /// Set the bit on matches, clear it on non-matches
     Replace,
-    /// Set the bit on matches only, leave non-matches untouched (additive).
+    /// Set the bit on matches
     Add,
-    /// Clear the bit on matches only, leave non-matches untouched.
+    /// Clear the bit on matches
     Remove,
 }
 
-/// Applies an already-resolved [`Selection`], so this can't fail: resolution --
-/// the only fallible half -- happened before any bit was touched, which is what
-/// makes a typo leave tracing state completely untouched.
+/// Applies an already-resolved [`Selection`] (infallible)
 fn apply(selection: &Selection, slot: u8, op: BitOp) {
     let b = bit(slot);
-    // One flat walk over the registry, matching on the key string. Two call sites
-    // sharing a key both match it, so a key with several sites toggles all of them
-    // for free -- there's no grouped view to keep aligned. `selection.keys` is
-    // sorted, so membership is a binary search.
+    // Walk the registry, match string keys. `selection.keys` is
+    // sorted, so we use binary search.
     for site in REGISTRY.iter() {
         let hit = selection.keys.binary_search(&site.name).is_ok();
         match (op, hit) {
@@ -120,11 +111,7 @@ fn apply(selection: &Selection, slot: u8, op: BitOp) {
     }
 }
 
-/// The keys enabled for `slot`.
-///
-/// Sorted and deduped explicitly. There's no id order left to inherit, so without
-/// this the linker's arbitrary `REGISTRY` order would leak into what callers see;
-/// dedup because one key can carry several call sites but is one selectable thing.
+/// Keys enabled for `slot`
 fn slot_names(slot: u8) -> impl Iterator<Item = &'static str> {
     let b = bit(slot);
     let mut names: Vec<&'static str> = REGISTRY
@@ -133,19 +120,16 @@ fn slot_names(slot: u8) -> impl Iterator<Item = &'static str> {
         .map(|site| site.name)
         .collect();
     names.sort_unstable();
+    // dedup because one key can carry multiple call sites
     names.dedup();
     names.into_iter()
 }
 
-// ---------------------------------------------------------------------------
-// Type-erased tracers + the slot table.
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Type-erased tracers + slot table
+// ===========================================================================
 
-/// Object-safe view of a [`Tracer`]: start a child span (from `builder`,
-/// parented to `parent`) and return a new `Context` whose current span is that
-/// child. This is how a concrete tracer of arbitrary span type is stored
-/// per-slot without naming its `Span` type -- the span is erased into the
-/// returned `Context` via `with_span`.
+/// Object-safe view of a [`Tracer`]
 trait DynTracer: Send + Sync {
     fn start_in(&self, builder: SpanBuilder, parent: &Context) -> Context;
 }
@@ -161,33 +145,17 @@ where
     }
 }
 
-/// Everything the slot layer owns: which slot holds which tracer, which slot (if
-/// any) is the distributed one, and which slot numbers are in play. All of it
-/// lives here so every change is one [`ArcSwap`] publish.
-///
-/// `next` bumps through `0..MAX_INSTRUMENTATIONS` for fresh slots, then `freed`
-/// is recycled. So the cap is on *concurrently live* instrumentations, not on how
-/// many are created over the process lifetime -- which matters for hot-reload,
-/// where an instrumentation is torn down and rebuilt every time its identity
-/// (tracer/endpoint) changes.
-///
-/// Slot reuse leaves one narrow race -- a span mis-attributed to the wrong
-/// instrumentation during a reload -- described in full at
-/// `docs/multi-instrumentation.md`.
 #[derive(Clone)]
 struct Slots {
     tracers: [Option<Arc<dyn DynTracer>>; MAX_INSTRUMENTATIONS as usize],
-    /// The slot held by the live distributed instrumentation, if there is one.
-    /// A distributed instrumentation is an ordinary slot plus this pointer: it is
-    /// enabled, disabled and dropped like any other, and only [`start_spans`]
-    /// treats its bit differently.
+    /// The slot held by the live distributed instrumentation
     distributed: Option<u8>,
     next: u8,
     freed: Vec<u8>,
 }
 
-impl Slots {
-    fn empty() -> Self {
+impl Default for Slots {
+    fn default() -> Self {
         Self {
             tracers: std::array::from_fn(|_| None),
             distributed: None,
@@ -195,8 +163,10 @@ impl Slots {
             freed: Vec::new(),
         }
     }
+}
 
-    /// Takes the next free slot, or `None` when [`MAX_INSTRUMENTATIONS`] are live.
+impl Slots {
+    /// Takes the next free slot, or `None` when we reached [`MAX_INSTRUMENTATIONS`]
     fn alloc(&mut self) -> Option<u8> {
         if let Some(slot) = self.freed.pop() {
             return Some(slot);
@@ -210,25 +180,14 @@ impl Slots {
     }
 }
 
-/// Lock-free-readable slot state. Read once per multi-slot call (a single atomic
-/// pointer load); swapped wholesale on the rare create/drop of an instrumentation.
-static SLOTS: LazyLock<ArcSwap<Slots>> = LazyLock::new(|| ArcSwap::from_pointee(Slots::empty()));
+/// Lock free (read) slot state. ArcSwap allows atomic swap on the (rare)
+/// create/drop of an instrumentation.
+/// We don't use RwLock here because reads are the hot path and ArcSwap is lock free + wait free
+static SLOTS: LazyLock<ArcSwap<Slots>> = LazyLock::new(|| ArcSwap::from_pointee(Slots::default()));
 
-/// Serializes writers so slot allocation is linearizable. Readers never take it.
-///
-/// This is why mutations don't use [`ArcSwap::rcu`]: `rcu` re-runs its closure when
-/// it loses the swap race, and allocating a slot is not idempotent -- a retry would
-/// hand out a second slot and leak the first.
+/// Write lock, so that writes happen sequentially
 static SLOTS_WRITE: Mutex<()> = Mutex::new(());
 
-/// Read-modify-publish the slot state under [`SLOTS_WRITE`]. `f` runs exactly
-/// once, so it may allocate; returning `Err` abandons the change and publishes
-/// nothing, which is what keeps a rejected `build` from leaving a half-taken slot
-/// behind.
-///
-/// Poisoning is tolerated rather than propagated: the guarded data lives in the
-/// `ArcSwap`, not in the mutex, so a writer that panicked left the last
-/// *published* snapshot intact and there is nothing to recover.
 fn update_slots<T, E>(f: impl FnOnce(&mut Slots) -> Result<T, E>) -> Result<T, E> {
     let _guard = SLOTS_WRITE.lock().unwrap_or_else(|e| e.into_inner());
     let mut next = (**SLOTS.load()).clone();
@@ -237,16 +196,14 @@ fn update_slots<T, E>(f: impl FnOnce(&mut Slots) -> Result<T, E>) -> Result<T, E
     Ok(out)
 }
 
-// ---------------------------------------------------------------------------
-// The per-call multi-slot state carried inside `Context`.
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// The multi slot state carried inside the OpenTelemetry `Context`
+// ===========================================================================
 
-/// The currently-active in-process slots' parent contexts, carried inside one
-/// `opentelemetry::Context` extension. Sparse: only slots active on this call
-/// path appear, so cloning it costs the active count, not the slot capacity.
+/// The active slots' parent contexts, carried inside a `Context` extension.
 ///
-/// The distributed slot is deliberately absent -- its parent is the ambient
-/// current span, which `Context` already carries.
+/// The distributed slot is missing from this one: the parent in that cae is "current"
+/// span, which `Context` has a dedicated field for.
 #[derive(Clone)]
 struct InProcessParents(SmallVec<[(u8, Context); 4]>);
 
@@ -336,9 +293,9 @@ pub fn start_spans(
     created_any.then_some(cx)
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // Public handle + builder.
-// ---------------------------------------------------------------------------
+// ===========================================================================
 
 /// Why [`InstrumentationBuilder::build`] could not produce an [`Instrumentation`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
