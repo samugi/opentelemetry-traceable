@@ -215,28 +215,29 @@ fn span_builder(name: &'static str, attrs: &[KeyValue]) -> SpanBuilder {
     }
 }
 
-/// Build one child span per active slot in `enabled_mask` and return the new
-/// `Context` to attach for the wrapped call, or `None` if no span was created --
-/// every active slot's instrumentation was dropped mid-flight -- in which case
-/// the caller runs the body with no context machinery at all.
+/// Called by the `#[traceable]` macro whenever the mask is non-zero.
 ///
-/// Not part of the stable API -- called by the `#[traceable]` macro whenever the
-/// mask is non-zero.
+/// Build one child span per active slot in `enabled_mask` and return the updated
+/// `Context`, or `None` if no span was created.
 ///
-/// The distributed slot (at most one) parents to the ambient current span and
-/// leaves its own span there. Every other slot parents within the
-/// [`InProcessParents`] envelope and never touches that span slot, so a slot's
-/// parent is strictly its own previous span on this call path.
+/// This leverages OpenTelemetry's `Context` threadl-local storage which uses
+/// RAII to guarantee the content of the context is always up to date and reflects
+/// the current state for the duration of a particular function call.
+///
+/// The distributed slot uses the `span` field of the context to store its current
+/// span, and it inherits the parent from the current `span` field of the context.
+///
+/// Every other slot uses the [`InProcessParents`] envelope of the `Context`,
+/// a generic slot's parent is bound to (and uses the tracer from) a dedicated slot
+/// in the envelope. Every slot follows a specific call path.
 #[doc(hidden)]
 pub fn start_spans(
     enabled_mask: u64,
     span_name: &'static str,
     attrs: Vec<KeyValue>,
 ) -> Option<Context> {
-    // `load_full`, not `load`: an arc-swap guard held across span construction
-    // would make `ArcSwap::store` -- i.e. a config reload -- wait on sampler and
-    // exporter latency, and nested traced calls would exhaust arc-swap's small
-    // per-thread borrow pool. An owned `Arc` costs one refcount bump and neither.
+    // we use `load_full` to avoid the arc-swap lock of `load` which would
+    // be blocking for a `store` (i.e. a config reload)
     let slots = SLOTS.load_full();
     let mut cx = Context::current();
     let mut created_any = false;
@@ -246,16 +247,14 @@ pub fn start_spans(
         .distributed
         .filter(|slot| enabled_mask & bit(*slot) != 0);
     if let Some(tracer) = distributed.and_then(|slot| slots.tracers[slot as usize].as_ref()) {
-        // Parent is whatever span is current -- an extracted remote parent, another
-        // library's span, or this instrumentation's own previous span -- and the
-        // child lands back in that same slot, so outbound injection picks it up.
+        // here parent is whatever span is current (could be remote, another
+        // library's span, or this instrumentation's own previous span) the
+        // child lands in that same slot.
         cx = tracer.start_in(span_builder(span_name, &attrs), &cx);
         created_any = true;
     }
 
-    // Everything else is in-process: parented within the envelope, invisible to
-    // `Context`'s span slot. Skipped entirely when only the distributed slot is
-    // active, which spares a distributed-only setup the envelope clone.
+    // Everything else is in-process: parented within the envelope.
     let in_process_mask = enabled_mask & !distributed.map_or(0, bit);
     if in_process_mask != 0 {
         let mut env: SmallVec<[(u8, Context); 4]> = cx
@@ -273,6 +272,7 @@ pub fn start_spans(
                 // Instrumentation was dropped mid-flight; just skip its slot.
                 continue;
             };
+            // TODO: can we make this faster
             let parent = env.iter().find(|(s, _)| *s == slot).map(|(_, c)| c);
             let base = parent.cloned().unwrap_or_default();
             let child = tracer.start_in(span_builder(span_name, &attrs), &base);
