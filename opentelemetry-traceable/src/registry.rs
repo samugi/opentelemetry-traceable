@@ -25,7 +25,7 @@ pub struct TraceSite {
     /// slot iff that slot's bit is set here. The disabled fast path is a single
     /// load of this word compared against zero, so a function no instrumentation
     /// cares about costs one atomic load.
-    pub enabled_mask: AtomicU64,
+    pub enabled_slots: AtomicU64,
 }
 
 impl TraceSite {
@@ -33,7 +33,7 @@ impl TraceSite {
     pub const fn new(name: &'static str) -> Self {
         Self {
             name,
-            enabled_mask: AtomicU64::new(0),
+            enabled_slots: AtomicU64::new(0),
         }
     }
 }

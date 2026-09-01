@@ -194,7 +194,7 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
                 ::opentelemetry_traceable::registry::TraceSite::new(#registry_key);
 
             let __traceable_mask =
-                __TRACEABLE_SITE.enabled_mask.load(::std::sync::atomic::Ordering::Relaxed);
+                __TRACEABLE_SITE.enabled_slots.load(::std::sync::atomic::Ordering::Relaxed);
             if __traceable_mask == 0u64 {
                 #block
             } else {

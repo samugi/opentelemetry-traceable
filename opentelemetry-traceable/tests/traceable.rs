@@ -31,7 +31,6 @@ fn instr(name: &'static str) -> (Instrumentation, InMemorySpanExporter) {
         .with_simple_exporter(exporter.clone())
         .build();
     let instr = Instrumentation::builder()
-        .name(name)
         .tracer(provider.tracer(name))
         .build()
         .expect("a free instrumentation slot");
@@ -46,7 +45,6 @@ fn distributed_instr(name: &'static str) -> (Instrumentation, InMemorySpanExport
         .with_simple_exporter(exporter.clone())
         .build();
     let instr = Instrumentation::builder()
-        .name(name)
         .tracer(provider.tracer(name))
         .distributed()
         .build()
@@ -810,7 +808,6 @@ fn only_one_distributed_instrumentation_may_be_live() {
     let (first, _exporter) = distributed_instr("edge");
 
     let second = Instrumentation::builder()
-        .name("second-edge")
         .tracer(SdkTracerProvider::builder().build().tracer("second-edge"))
         .distributed()
         .build();
