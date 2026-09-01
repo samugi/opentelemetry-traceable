@@ -1,6 +1,8 @@
 use opentelemetry::Context;
 use smallvec::SmallVec;
 
+pub type Envelope = SmallVec<[(u8, Context); 4]>;
+
 /// The slotted envelope carried inside an OpenTelemetry `Context` extension.
 ///
 /// Holds (slot_number, span_context) tuples, used to identify the active span for
@@ -10,4 +12,4 @@ use smallvec::SmallVec;
 /// The distributed slot is not handled here: the parent in that case is "current"
 /// span, which `Context` has a dedicated field for.
 #[derive(Clone)]
-pub struct InProcessParents(pub SmallVec<[(u8, Context); 4]>);
+pub struct InProcessParents(pub Envelope);

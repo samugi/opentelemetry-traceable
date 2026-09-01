@@ -58,14 +58,13 @@ use std::sync::atomic::Ordering;
 
 use opentelemetry::trace::{SpanBuilder, Tracer};
 use opentelemetry::{Context, KeyValue};
-use smallvec::SmallVec;
 
 mod context;
 mod helpers;
 mod slots;
 mod tracer;
 
-use crate::instrumentation::context::InProcessParents;
+use crate::instrumentation::context::{Envelope, InProcessParents};
 use crate::instrumentation::helpers::{BitOp, apply, slot_names};
 use crate::instrumentation::slots::{SLOTS, update_slots};
 use crate::instrumentation::tracer::DynTracer;
@@ -131,7 +130,7 @@ pub fn start_spans(
     // Everything else is in-process: parented within the envelope.
     let in_process_mask = enabled_slots & !distributed.map_or(0, bit);
     if in_process_mask != 0 {
-        let mut envelope: SmallVec<[(u8, Context); 4]> = cx
+        let mut envelope: Envelope = cx
             .get::<InProcessParents>()
             .map(|s| s.0.clone())
             .unwrap_or_default();
@@ -146,8 +145,10 @@ pub fn start_spans(
                 // Instrumentation was dropped mid-flight; just skip its slot.
                 continue;
             };
-            // load the parent from the corresponding slot
-            // TODO: can we make this faster
+            // Load the parent from the corresponding slot.
+            // In the most common scenario this linear search iterates a small number of
+            // elements. The hard cap is 64, and typically there will be few instrumentations
+            // configured.
             let parent = envelope.iter().find(|(s, _)| *s == slot).map(|(_, c)| c);
             let base = parent.cloned().unwrap_or_default();
             let child = tracer.start_in(span_builder(span_name, &attrs), &base);
