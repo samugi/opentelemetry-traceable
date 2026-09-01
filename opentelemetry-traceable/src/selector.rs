@@ -1,4 +1,5 @@
-//! Selecting `#[traceable]` functions by name, exactly or by `*` glob.
+//! Selecting `#[traceable]` functions by name, using exact match, or `*`
+//! pattern match.
 //!
 //! A trace site's registry key -- `module_path!() + "::" + fn_name`, or the
 //! macro's `name` argument -- *is* its identity. There is no id, index, or
