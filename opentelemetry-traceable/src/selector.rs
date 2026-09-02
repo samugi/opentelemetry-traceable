@@ -1,94 +1,76 @@
-//! Selecting `#[traceable]` functions by name, using exact match, or `*`
-//! pattern match.
+//! Selecting `#[traceable]` functions by name/key, using exact match,
+//! or `*` pattern match.
 //!
-//! A trace site's registry key -- `module_path!() + "::" + fn_name`, or the
-//! macro's `name` argument -- *is* its identity. There is no id, index, or
-//! encoded form: configuration names the functions it wants, the way DTrace
-//! names probes, over a probe set that happens to be declared at compile time.
+//! Name/key is either:
+//! * `module_path!() + "::" + fn_name`
+//! * the macro's `name` argument
 //!
-//! # Globs
+//! # Patterns
 //!
-//! `*` matches any run of characters, **including `::`**. That is the only
-//! wildcard, and it has no `**` counterpart: how deeply a function is nested is
-//! an implementation detail of the code being traced, not something the operator
-//! selecting it should have to track.
+//! `*` matches any sequence of characters. It acts as a wildcard.
 //!
 //! ```text
 //! my_app::domain::db::*   matches  my_app::domain::db::users::insert
 //!                         matches  my_app::domain::db::query
-//!                     does NOT match  my_app::domain::db      (nothing after `::`)
+//!                         does NOT match  my_app::domain::db
 //! *::db::*                matches  any db function, in any crate or module
 //! *                       matches  everything
 //! ```
 //!
-//! # Typos are errors, empty globs are warnings
+//! # Typos are errors, empty patterns are warnings
 //!
 //! An *exact* selector that matches nothing is almost certainly a typo, so
-//! [`resolve`] fails ([`UnknownKeys`]) and callers apply nothing -- tracing an
-//! unnoticed subset of what was asked for is worse than refusing. A *glob* that
-//! matches nothing is only reported ([`Selection::unmatched_globs`]), since it
-//! can legitimately match nothing in a build where those functions were compiled
-//! out.
+//! [`resolve`] fails ([`UnknownKeys`]) and callers apply nothing. A *pattern* that
+//! matches nothing is only reported ([`Selection::unmatched_patterns`]).
 
 use crate::registry;
 
-/// Whether `selector` is a glob (contains `*`) rather than an exact registry key.
-pub fn is_glob(selector: &str) -> bool {
+/// Whether `selector` is a pattern (contains `*`) rather than an exact key.
+pub fn is_pattern(selector: &str) -> bool {
     selector.contains('*')
 }
 
-/// Whether `pattern` matches `key`, treating `*` as any run of characters
-/// including `::`. With no `*`, this is plain equality.
+/// Whether `pattern` matches `key`.
 pub fn matches(pattern: &str, key: &str) -> bool {
-    // The literals between the `*`s, in order. The first is anchored to the
-    // start, the last to the end, and everything between just has to appear in
-    // order.
-    let mut literals = pattern.split('*');
-    let first = literals
+    let mut pattern_segments = pattern.split('*');
+    let first_pattern_segment = pattern_segments
         .next()
         .expect("`split` always yields at least one part");
-    let Some(mut rest) = key.strip_prefix(first) else {
+
+    let Some(mut key_after_prefix) = key.strip_prefix(first_pattern_segment) else {
+        // key does not start with `first_pattern_segment` --> no match
         return false;
     };
-    let Some(last) = literals.next_back() else {
-        // No `*` anywhere, so `first` was the whole pattern and had to consume
-        // the whole key.
-        return rest.is_empty();
+    let Some(last_pattern_segment) = pattern_segments.next_back() else {
+        // `first_pattern_segment` was the whole pattern, so it must
+        // be equal to the whole key for a match.
+        return key_after_prefix.is_empty();
     };
-    for middle in literals {
-        // Leftmost match is optimal here: every middle literal is flanked by
-        // unbounded `*`, so consuming as little as possible leaves the most for
-        // what follows. Adjacent `*`s yield an empty literal, which `find`
-        // trivially matches at 0 -- a no-op, as it should be.
-        match rest.find(middle) {
-            Some(at) => rest = &rest[at + middle.len()..],
+    for mid_pattern_segment in pattern_segments {
+        // Find each segment and slide the key.
+        // If segments are all found in order we have a match.
+        match key_after_prefix.find(mid_pattern_segment) {
+            Some(at) => key_after_prefix = &key_after_prefix[at + mid_pattern_segment.len()..],
             None => return false,
         }
     }
-    // Anchoring the trailing literal is what keeps overlap out: `*aa*aa` must
-    // not match `aaa`, even though both `aa`s can be found in it.
-    rest.ends_with(last)
+
+    key_after_prefix.ends_with(last_pattern_segment)
 }
 
-/// What a list of selectors resolved to against this binary's registry.
+/// Result of a selection (match of a list of selectors).
 #[derive(Debug, Clone, Default)]
 pub struct Selection {
-    /// The distinct registry keys matched, sorted -- so anything derived from a
-    /// `Selection` is reproducible run to run.
+    /// Registry keys that matched.
     pub keys: Vec<&'static str>,
-    /// Globs that matched no key. Reported rather than fatal: a glob can
-    /// legitimately match nothing in a build where those functions were compiled
-    /// out.
-    pub unmatched_globs: Vec<String>,
+    /// Patterns that matched no key.
+    pub unmatched_patterns: Vec<String>,
 }
 
 /// Exact selectors that match no `#[traceable]` function in this binary.
-///
-/// Returned by [`resolve`] instead of a partial result, so a typo leaves tracing
-/// state untouched rather than silently enabling a subset of what was asked for.
 #[derive(Debug, Clone)]
 pub struct UnknownKeys {
-    /// The unrecognized selectors, in the order they were given.
+    /// The unrecognized selectors.
     pub keys: Vec<String>,
 }
 
@@ -100,38 +82,38 @@ impl std::fmt::Display for UnknownKeys {
 
 impl std::error::Error for UnknownKeys {}
 
-/// Resolve `selectors` -- exact registry keys, `*` globs, or a mix -- against
+/// Resolve `selectors` -- exact registry keys, `*` patterns, or a mix -- against
 /// every `#[traceable]` function linked into this binary.
 ///
 /// Selectors are trimmed, and blank ones are ignored. Nothing is applied here,
 /// which also makes this the dry-run entry point: resolve first to preview what a
-/// glob would select. To apply a selection, hand the selectors to
+/// pattern would select. To apply a selection, hand the selectors to
 /// [`Instrumentation::set_enabled`](crate::instrumentation::Instrumentation::set_enabled)
 /// and friends.
 ///
 /// # Errors
 ///
-/// [`UnknownKeys`] if any *exact* selector matches no function. Unmatched *globs*
-/// come back in [`Selection::unmatched_globs`] instead.
+/// [`UnknownKeys`] if any *exact* selector matches no function. Unmatched *patterns*
+/// come back in [`Selection::unmatched_patterns`] instead.
 pub fn resolve<S: AsRef<str>>(selectors: &[S]) -> Result<Selection, UnknownKeys> {
     let keys = registry::keys();
     let mut matched: Vec<&'static str> = Vec::new();
     let mut unknown: Vec<String> = Vec::new();
-    let mut unmatched_globs: Vec<String> = Vec::new();
+    let mut unmatched_patterns: Vec<String> = Vec::new();
 
     for selector in selectors {
         let selector = selector.as_ref().trim();
         if selector.is_empty() {
             continue;
         }
-        if is_glob(selector) {
+        if is_pattern(selector) {
             // Comparing lengths is a sound "matched nothing" test even when an
             // earlier selector already covered the same keys: duplicates are
             // pushed here and only collapsed once, at the end.
             let before = matched.len();
             matched.extend(keys.iter().copied().filter(|key| matches(selector, key)));
             if matched.len() == before {
-                unmatched_globs.push(selector.to_string());
+                unmatched_patterns.push(selector.to_string());
             }
         } else {
             // `keys` is sorted, so an exact selector is one binary search.
@@ -151,6 +133,6 @@ pub fn resolve<S: AsRef<str>>(selectors: &[S]) -> Result<Selection, UnknownKeys>
     matched.dedup();
     Ok(Selection {
         keys: matched,
-        unmatched_globs,
+        unmatched_patterns,
     })
 }
