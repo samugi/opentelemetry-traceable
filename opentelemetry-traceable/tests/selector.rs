@@ -1,14 +1,6 @@
-//! Tests for selecting trace sites by key and by `*` glob.
-//!
-//! [`matches`] is pure, so most of this is a table. The [`resolve`] tests run
-//! against this test binary's own registry -- each integration test file links its
-//! own `#[traceable]` set, so the fixtures below are the *only* keys here, which
-//! makes exact assertions about the whole key list possible.
-//!
-//! [`matches`]: opentelemetry_traceable::selector::matches
-//! [`resolve`]: opentelemetry_traceable::selector::resolve
+//! Tests for selecting trace sites by key and by `*` pattern.
 
-use opentelemetry_traceable::selector::{self, is_glob, matches};
+use opentelemetry_traceable::selector::{self, is_pattern, matches};
 use opentelemetry_traceable::{registry, traceable};
 
 #[traceable(name = "sel::a::one")]
@@ -31,7 +23,6 @@ fn b_four() -> u64 {
     4
 }
 
-/// Every key this binary knows, in the sorted order `registry::keys()` promises.
 fn all_keys() -> Vec<&'static str> {
     vec![
         "sel::a::deep::three",
@@ -47,14 +38,13 @@ fn fixtures_register_exactly_the_expected_keys() {
     assert_eq!(registry::keys().to_vec(), all_keys());
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // matches
-// ---------------------------------------------------------------------------
+// ===========================================================================
 
 #[test]
 fn a_glob_spans_module_separators() {
-    // The whole point of the single-`*` rule: nesting depth is invisible to
-    // whoever is selecting.
+    // nesting depth is invisible to whoever is selecting.
     assert!(matches("sel::a::*", "sel::a::one"));
     assert!(matches("sel::a::*", "sel::a::deep::three"));
     assert!(matches("sel::*", "sel::a::deep::three"));
@@ -103,16 +93,16 @@ fn adjacent_globs_are_a_no_op() {
 }
 
 #[test]
-fn is_glob_detects_the_wildcard() {
-    assert!(is_glob("sel::a::*"));
-    assert!(is_glob("*"));
-    assert!(!is_glob("sel::a::one"));
-    assert!(!is_glob(""));
+fn is_pattern_detects_the_wildcard() {
+    assert!(is_pattern("sel::a::*"));
+    assert!(is_pattern("*"));
+    assert!(!is_pattern("sel::a::one"));
+    assert!(!is_pattern(""));
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // resolve
-// ---------------------------------------------------------------------------
+// ===========================================================================
 
 #[test]
 fn resolve_expands_a_glob_into_sorted_keys() {
@@ -121,7 +111,7 @@ fn resolve_expands_a_glob_into_sorted_keys() {
         selection.keys,
         vec!["sel::a::deep::three", "sel::a::one", "sel::a::two"]
     );
-    assert!(selection.unmatched_globs.is_empty());
+    assert!(selection.unmatched_patterns.is_empty());
 }
 
 #[test]
@@ -145,7 +135,7 @@ fn a_glob_matching_nothing_is_reported_but_not_an_error() {
     let selection =
         selector::resolve(&["sel::nothing::*"]).expect("a glob is never an error, only a report");
     assert!(selection.keys.is_empty());
-    assert_eq!(selection.unmatched_globs, vec!["sel::nothing::*"]);
+    assert_eq!(selection.unmatched_patterns, vec!["sel::nothing::*"]);
 }
 
 #[test]
@@ -153,7 +143,7 @@ fn a_mixed_glob_list_still_applies_the_half_that_matched() {
     let selection =
         selector::resolve(&["sel::b::*", "sel::nothing::*"]).expect("globs never error");
     assert_eq!(selection.keys, vec!["sel::b::four"]);
-    assert_eq!(selection.unmatched_globs, vec!["sel::nothing::*"]);
+    assert_eq!(selection.unmatched_patterns, vec!["sel::nothing::*"]);
 }
 
 #[test]
@@ -161,7 +151,7 @@ fn overlapping_selectors_yield_each_key_once() {
     let selection =
         selector::resolve(&["*", "sel::a::*", "sel::a::one"]).expect("every selector is known");
     assert_eq!(selection.keys, all_keys());
-    assert!(selection.unmatched_globs.is_empty());
+    assert!(selection.unmatched_patterns.is_empty());
 }
 
 #[test]
@@ -169,7 +159,7 @@ fn blank_selectors_are_ignored_rather_than_unknown() {
     let selection =
         selector::resolve(&["", "   ", "sel::b::four"]).expect("blanks are skipped, not resolved");
     assert_eq!(selection.keys, vec!["sel::b::four"]);
-    assert!(selection.unmatched_globs.is_empty());
+    assert!(selection.unmatched_patterns.is_empty());
 }
 
 #[test]
@@ -182,5 +172,5 @@ fn selectors_are_trimmed() {
 fn resolving_nothing_selects_nothing() {
     let selection = selector::resolve::<&str>(&[]).expect("an empty list is valid");
     assert!(selection.keys.is_empty());
-    assert!(selection.unmatched_globs.is_empty());
+    assert!(selection.unmatched_patterns.is_empty());
 }

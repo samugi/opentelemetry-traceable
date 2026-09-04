@@ -1,14 +1,4 @@
 //! Integration tests for `#[traceable]` span creation and dynamic enable/disable.
-//!
-//! Every test drives its own [`Instrumentation`] with its own in-memory
-//! exporter, and a fresh instrumentation starts with every bit clear -- so
-//! there's no global tracer or default instrumentation to reset between tests.
-//!
-//! What *is* still shared is the traced functions themselves: their enabled bits
-//! live in the process-global `linkme` registry, so a test that enables a
-//! function will collect a span from any concurrently-running test that calls
-//! it. Hence `cargo nextest run` (process-per-test), enforced by
-//! `check_test_runner.rs`.
 
 use std::collections::HashMap;
 
@@ -22,10 +12,7 @@ use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
 use opentelemetry_traceable::instrumentation::{BuildError, Instrumentation};
 use opentelemetry_traceable::traceable;
 
-/// Build an instrumentation with its own in-memory exporter/provider. The
-/// returned exporter observes only this instrumentation's spans; the tracer
-/// keeps its provider alive for the instrumentation's lifetime.
-fn instr(name: &'static str) -> (Instrumentation, InMemorySpanExporter) {
+fn in_process_instr(name: &'static str) -> (Instrumentation, InMemorySpanExporter) {
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
@@ -37,8 +24,6 @@ fn instr(name: &'static str) -> (Instrumentation, InMemorySpanExporter) {
     (instr, exporter)
 }
 
-/// As [`instr`], but the *distributed* kind: it parents to whatever span is
-/// current and leaves its own span there. At most one may be live at a time.
 fn distributed_instr(name: &'static str) -> (Instrumentation, InMemorySpanExporter) {
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
@@ -52,8 +37,6 @@ fn distributed_instr(name: &'static str) -> (Instrumentation, InMemorySpanExport
     (instr, exporter)
 }
 
-/// A valid remote span context, standing in for what a propagator extracts from
-/// an incoming `traceparent` -- or for a web framework's own server span.
 fn remote_parent() -> SpanContext {
     SpanContext::new(
         TraceId::from_bytes([
@@ -67,8 +50,7 @@ fn remote_parent() -> SpanContext {
     )
 }
 
-/// This instrumentation's enabled keys, sorted -- `enabled_names` promises that
-/// order, so tests can compare against a plain slice.
+/// instrumentation's enabled keys.
 fn enabled(instr: &Instrumentation) -> Vec<&'static str> {
     instr.enabled_names().collect()
 }
@@ -123,16 +105,13 @@ async fn shared_async_leaf() -> u64 {
     5
 }
 
-/// Reports whether the ambient `Context`'s own span slot holds a valid span --
-/// used to prove which kind writes into it.
+/// Whether the ambient `Context`'s own span slot holds a valid span.
 #[traceable(name = "probe::ambient")]
 fn probe_ambient() -> bool {
     Context::current().span().span_context().is_valid()
 }
 
-/// Injects the ambient context into a carrier the way an outbound HTTP client
-/// would, from inside a traced body. This is the real propagation contract:
-/// a propagator only ever sees `Context`'s span slot.
+/// Injects the ambient context into a carrier the way an HTTP client would.
 #[traceable(name = "probe::inject")]
 fn probe_inject() -> HashMap<String, String> {
     let mut carrier = HashMap::new();
@@ -149,10 +128,8 @@ impl Widget {
     }
 }
 
-// Two same-named methods on different types in one module. A registry key isn't
-// qualified by the surrounding `impl`, so both of these carry the *same* key and
-// are one selectable thing that toggles together. Deliberate, and pinned by
-// `two_sites_sharing_a_key_toggle_together` below.
+// Two same-named methods on different types in the same module
+// (toggled together).
 struct Left;
 struct Right;
 
@@ -172,7 +149,7 @@ impl Right {
 
 #[test]
 fn disabled_by_default_emits_no_span() {
-    let (_instr, exporter) = instr("A");
+    let (_instr, exporter) = in_process_instr("A");
 
     let result = plain(1);
 
@@ -182,7 +159,7 @@ fn disabled_by_default_emits_no_span() {
 
 #[test]
 fn enabling_emits_a_span_with_default_name() {
-    let (instr, exporter) = instr("A");
+    let (instr, exporter) = in_process_instr("A");
     instr.enable(&[concat!(module_path!(), "::plain")]).unwrap();
 
     let result = plain(1);
@@ -195,7 +172,7 @@ fn enabling_emits_a_span_with_default_name() {
 
 #[test]
 fn custom_span_name_and_the_instrumentations_tracer_scope() {
-    let (instr, exporter) = instr("test-tracer");
+    let (instr, exporter) = in_process_instr("test-tracer");
     instr.enable(&["custom.span"]).unwrap();
 
     let result = named();
@@ -204,14 +181,12 @@ fn custom_span_name_and_the_instrumentations_tracer_scope() {
     let spans = exporter.get_finished_spans().unwrap();
     assert_eq!(spans.len(), 1);
     assert_eq!(spans[0].name, "custom.span");
-    // The scope comes from the instrumentation's own tracer -- a call site has
-    // no say in it, since the `tracer` macro argument no longer exists.
     assert_eq!(spans[0].instrumentation_scope.name(), "test-tracer");
 }
 
 #[test]
 fn fields_become_span_attributes() {
-    let (instr, exporter) = instr("A");
+    let (instr, exporter) = in_process_instr("A");
     instr
         .enable(&[concat!(module_path!(), "::with_fields")])
         .unwrap();
@@ -236,7 +211,7 @@ fn fields_become_span_attributes() {
 
 #[tokio::test]
 async fn async_function_is_instrumented_when_enabled() {
-    let (instr, exporter) = instr("A");
+    let (instr, exporter) = in_process_instr("A");
     instr
         .enable(&[concat!(module_path!(), "::plain_async")])
         .unwrap();
@@ -251,7 +226,7 @@ async fn async_function_is_instrumented_when_enabled() {
 
 #[test]
 fn nested_spans_share_a_trace_and_correct_parent() {
-    let (instr, exporter) = instr("A");
+    let (instr, exporter) = in_process_instr("A");
     instr
         .enable(&["nesting::parent", "nesting::child"])
         .unwrap();
@@ -275,10 +250,7 @@ fn nested_spans_share_a_trace_and_correct_parent() {
 
 #[test]
 fn disabling_parent_does_not_suppress_enabled_child() {
-    let (instr, exporter) = instr("A");
-    // Only the child is enabled -- the parent function still runs (and still
-    // calls the child) but must not itself be wrapped in a span, and must not
-    // prevent the child's span from being recorded.
+    let (instr, exporter) = in_process_instr("A");
     instr.enable(&["nesting::child"]).unwrap();
 
     let result = parent();
@@ -291,7 +263,7 @@ fn disabling_parent_does_not_suppress_enabled_child() {
 
 #[test]
 fn method_inside_impl_block_is_instrumented() {
-    let (instr, exporter) = instr("A");
+    let (instr, exporter) = in_process_instr("A");
     instr.enable(&["widget::render"]).unwrap();
 
     let result = Widget.render();
@@ -304,7 +276,7 @@ fn method_inside_impl_block_is_instrumented() {
 
 #[test]
 fn set_enabled_replaces_the_active_subset() {
-    let (instr, exporter) = instr("A");
+    let (instr, exporter) = in_process_instr("A");
     instr
         .enable(&[concat!(module_path!(), "::plain"), "custom.span"])
         .unwrap();
@@ -318,9 +290,6 @@ fn set_enabled_replaces_the_active_subset() {
     assert_eq!(spans[0].name, "custom.span");
 }
 
-// Registration happens at compile time (the linkme-collected static lives
-// inside each function's body), not on first call -- so every traceable fn
-// should show up here even without being invoked in this test.
 #[test]
 fn registry_discovers_all_traceable_functions_in_this_binary() {
     let names: std::collections::HashSet<_> = opentelemetry_traceable::registry::keys()
@@ -335,25 +304,18 @@ fn registry_discovers_all_traceable_functions_in_this_binary() {
 
 #[test]
 fn enabled_names_reflects_the_active_subset() {
-    let (instr, _exporter) = instr("A");
+    let (instr, _exporter) = in_process_instr("A");
     instr
         .enable(&["nesting::parent", "nesting::child"])
         .unwrap();
 
-    // Compared as an ordered slice rather than a set: `enabled_names` sorts, and
-    // that reproducibility is a promise now that there's no id order to inherit.
     assert_eq!(enabled(&instr), ["nesting::child", "nesting::parent"]);
 }
 
-// A site's enabled state is the *union* across instrumentations, and each one
-// owns exactly its own bit. Pinned explicitly because it is the invariant any
-// future consolidation of the per-site masks has to preserve: a derived
-// "is anyone tracing this site" summary must stay set while *any* instrumentation
-// still wants the site, and must not be clobbered by another one disabling it.
 #[test]
 fn one_instrumentation_disabling_a_site_leaves_the_others_alone() {
-    let (a, exporter_a) = instr("A");
-    let (b, exporter_b) = instr("B");
+    let (a, exporter_a) = in_process_instr("A");
+    let (b, exporter_b) = in_process_instr("B");
 
     a.enable(&["nesting::child"]).unwrap();
     b.enable(&["nesting::child"]).unwrap();
@@ -385,14 +347,13 @@ fn one_instrumentation_disabling_a_site_leaves_the_others_alone() {
 }
 
 // --- Dynamic reconfiguration -------------------------------------------------
-// Hot-reload drives these paths on every `config.yaml` save, so they get explicit
-// coverage: repeated reconfiguration must not accumulate stale state, concurrent
+// Repeated reconfiguration must not accumulate stale state, concurrent
 // reconfiguration must not lose an update, and rebuilding an instrumentation while
 // traced functions are running must stay consistent.
 
 #[test]
 fn repeated_reconfiguration_leaves_no_stale_state() {
-    let (instr, exporter) = instr("A");
+    let (instr, exporter) = in_process_instr("A");
 
     for _ in 0..50 {
         instr.set_enabled(&["nesting::parent"]).unwrap();
@@ -416,11 +377,11 @@ fn repeated_reconfiguration_leaves_no_stale_state() {
 
 #[test]
 fn concurrent_reconfiguration_of_two_instrumentations_loses_nothing() {
-    let (a, _exporter_a) = instr("A");
-    let (b, _exporter_b) = instr("B");
+    let (a, _exporter_a) = in_process_instr("A");
+    let (b, _exporter_b) = in_process_instr("B");
 
-    // Each instrumentation owns its own bit, so hammering both at once must leave
-    // both final states intact rather than one clobbering the other.
+    // Each instrumentation owns its own bit, they must not interfere
+    // with one another when set concurrently.
     std::thread::scope(|scope| {
         scope.spawn(|| {
             for _ in 0..200 {
@@ -440,9 +401,6 @@ fn concurrent_reconfiguration_of_two_instrumentations_loses_nothing() {
 
 #[test]
 fn rebuilding_an_instrumentation_under_load_stays_consistent() {
-    // Identity changes in `config.yaml` tear an instrumentation down and build a
-    // fresh one, recycling its slot -- while traced functions keep running. Each
-    // generation must only ever collect spans for keys it actually enabled.
     let stop = std::sync::atomic::AtomicBool::new(false);
 
     std::thread::scope(|scope| {
@@ -453,7 +411,7 @@ fn rebuilding_an_instrumentation_under_load_stays_consistent() {
         });
 
         for _ in 0..50 {
-            let (instr, exporter) = instr("churn");
+            let (instr, exporter) = in_process_instr("churn");
             instr
                 .enable(&["nesting::parent", "nesting::child"])
                 .unwrap();
@@ -474,7 +432,7 @@ fn rebuilding_an_instrumentation_under_load_stays_consistent() {
 
 #[test]
 fn set_enabled_toggles_spans_by_key() {
-    let (instr, exporter) = instr("A");
+    let (instr, exporter) = in_process_instr("A");
 
     instr.set_enabled(&["nesting::child"]).unwrap();
     let result = parent();
@@ -487,7 +445,7 @@ fn set_enabled_toggles_spans_by_key() {
 
 #[test]
 fn enable_and_disable_are_additive_and_subtractive() {
-    let (instr, exporter) = instr("A");
+    let (instr, exporter) = in_process_instr("A");
 
     instr
         .enable(&["nesting::parent", "nesting::child"])
@@ -503,7 +461,7 @@ fn enable_and_disable_are_additive_and_subtractive() {
 
 #[test]
 fn a_glob_enables_every_key_beneath_it() {
-    let (instr, exporter) = instr("A");
+    let (instr, exporter) = in_process_instr("A");
     let selection = instr.set_enabled(&["nesting::*"]).unwrap();
 
     assert_eq!(selection.keys, ["nesting::child", "nesting::parent"]);
@@ -521,7 +479,7 @@ fn a_glob_enables_every_key_beneath_it() {
 
 #[test]
 fn a_bare_glob_selects_the_same_set_as_enable_all() {
-    let (via_glob, _exporter) = instr("A");
+    let (via_glob, _exporter) = in_process_instr("A");
     via_glob.set_enabled(&["*"]).unwrap();
     let through_glob = enabled(&via_glob);
 
@@ -530,7 +488,7 @@ fn a_bare_glob_selects_the_same_set_as_enable_all() {
 
 #[test]
 fn an_empty_selector_list_clears_everything() {
-    let (instr, exporter) = instr("A");
+    let (instr, exporter) = in_process_instr("A");
     instr.enable(&["nesting::*"]).unwrap();
 
     let cleared = instr.set_enabled::<&str>(&[]).unwrap();
@@ -543,23 +501,21 @@ fn an_empty_selector_list_clears_everything() {
 
 #[test]
 fn a_glob_matching_nothing_is_reported_but_applies_the_rest() {
-    let (instr, _exporter) = instr("A");
+    let (instr, _exporter) = in_process_instr("A");
 
     let selection = instr
         .enable(&["nesting::parent", "no::such::module::*"])
         .unwrap();
 
-    assert_eq!(selection.unmatched_globs, ["no::such::module::*"]);
+    assert_eq!(selection.unmatched_patterns, ["no::such::module::*"]);
     assert_eq!(enabled(&instr), ["nesting::parent"]);
 }
 
 #[test]
 fn an_unknown_exact_key_is_rejected_and_leaves_the_subset_untouched() {
-    let (instr, _exporter) = instr("A");
+    let (instr, _exporter) = in_process_instr("A");
     instr.enable(&["nesting::parent"]).unwrap();
 
-    // The reason resolution happens before any bit is touched: one typo must not
-    // partially apply the rest of the list.
     let error = instr
         .set_enabled(&["nesting::child", "nesting::typo"])
         .expect_err("`nesting::typo` is not a registry key");
@@ -574,11 +530,9 @@ fn an_unknown_exact_key_is_rejected_and_leaves_the_subset_untouched() {
 
 #[test]
 fn two_sites_sharing_a_key_toggle_together() {
-    let (instr, exporter) = instr("A");
+    let (instr, exporter) = in_process_instr("A");
     let key = concat!(module_path!(), "::shared_method");
 
-    // One selector, two call sites -- the flat registry walk matches both because
-    // they carry the same string.
     let selection = instr.set_enabled(&[key]).unwrap();
     assert_eq!(
         selection.keys,
@@ -602,11 +556,6 @@ fn two_sites_sharing_a_key_toggle_together() {
 
 #[test]
 fn keys_are_the_sorted_deduped_registry_keys() {
-    // This no longer guards identity -- nothing is addressed by position any
-    // more, so a different order would change nothing about what a config
-    // selects. What it does guard is determinism: neither `keys()` nor the
-    // `*_names()` listings may leak the linker's arbitrary `REGISTRY` order,
-    // which shifts between builds, out to callers.
     let keys = opentelemetry_traceable::registry::keys();
 
     let mut expected: Vec<&str> = opentelemetry_traceable::registry::REGISTRY
@@ -627,14 +576,9 @@ fn keys_are_the_sorted_deduped_registry_keys() {
 
 #[test]
 fn in_process_spans_never_land_in_the_ambient_context_span_slot() {
-    let (instr, exporter) = instr("A");
+    let (instr, exporter) = in_process_instr("A");
     instr.enable(&["probe::ambient"]).unwrap();
 
-    // The probe reports what it sees in `Context::current().span()` from inside
-    // its own traced body. A span *was* created for it (asserted below), but it
-    // lives in the extension envelope, so the span slot stays empty -- which is
-    // exactly why outbound `traceparent` injection carries nothing from an
-    // in-process instrumentation.
     let saw_ambient_span = probe_ambient();
 
     assert!(
@@ -646,7 +590,7 @@ fn in_process_spans_never_land_in_the_ambient_context_span_slot() {
 
 #[test]
 fn in_process_spans_are_not_injected_into_an_outbound_carrier() {
-    let (instr, exporter) = instr("A");
+    let (instr, exporter) = in_process_instr("A");
     instr.enable(&["probe::inject"]).unwrap();
 
     let carrier = probe_inject();
@@ -660,7 +604,7 @@ fn in_process_spans_are_not_injected_into_an_outbound_carrier() {
 
 #[test]
 fn in_process_does_not_join_an_ambient_incoming_parent() {
-    let (instr, exporter) = instr("A");
+    let (instr, exporter) = in_process_instr("A");
     instr.enable(&["nesting::parent"]).unwrap();
 
     let remote = remote_parent();
@@ -693,8 +637,8 @@ fn distributed_joins_an_incoming_remote_parent() {
     instr.enable(&["nesting::parent"]).unwrap();
     assert!(instr.is_distributed());
 
-    // Stands in for a propagator-extracted incoming `traceparent`, or a web
-    // framework's server span: a valid span context in the ambient span slot.
+    // Simulates a propagator who injected the incoming context in the current
+    // OTel context.
     let remote = remote_parent();
     let guard = Context::current()
         .with_remote_span_context(remote.clone())
@@ -722,10 +666,12 @@ fn distributed_span_becomes_the_ambient_current_span() {
     let (instr, exporter) = distributed_instr("edge");
     instr.enable(&["probe::ambient"]).unwrap();
 
-    // The mirror of the in-process case above: the span goes *into* the slot a
-    // propagator injects from, which is what makes outbound propagation work.
     let saw_ambient_span = probe_ambient();
 
+    // Note: probe_ambient() is `traceable` and enabled, so it itself produces
+    // a span.
+    // This instrumentation is `distributed`, so the span goes into the standard
+    // Context `span` field, which is what makes outbound propagation work.
     assert!(
         saw_ambient_span,
         "a distributed span must be the current span for the wrapped call"
@@ -738,6 +684,9 @@ fn distributed_spans_are_injected_into_an_outbound_carrier() {
     let (instr, exporter) = distributed_instr("edge");
     instr.enable(&["probe::inject"]).unwrap();
 
+    // Note: probe_inject is `traceable` and enabled, so it itself produces
+    // a span which is set in the standard Context `span` field that propagators
+    // know to look into.
     let carrier = probe_inject();
 
     let spans = exporter.get_finished_spans().unwrap();
@@ -745,8 +694,8 @@ fn distributed_spans_are_injected_into_an_outbound_carrier() {
     let traceparent = carrier
         .get("traceparent")
         .expect("a distributed span must be injected by an ordinary propagator");
-    // `00-<trace_id>-<span_id>-<flags>`: the downstream service continues *this*
-    // span, with no propagator code in this crate.
+    // `00-<trace_id>-<span_id>-<flags>`: the downstream service can now continue
+    // *this* trace.
     assert!(
         traceparent.contains(&format!("{:032x}", spans[0].span_context.trace_id())),
         "carried the wrong trace: {traceparent}"
@@ -820,7 +769,7 @@ fn only_one_distributed_instrumentation_may_be_live() {
     assert!(first.is_distributed());
 
     // An in-process one is unaffected -- the limit is on the role, not on slots.
-    let (in_process, _exp) = instr("A");
+    let (in_process, _exp) = in_process_instr("A");
     assert!(!in_process.is_distributed());
 }
 
@@ -840,7 +789,7 @@ fn dropping_a_distributed_instrumentation_releases_the_role() {
 #[test]
 fn a_distributed_and_an_in_process_instrumentation_stay_isolated() {
     let (dist, exp_dist) = distributed_instr("edge");
-    let (local, exp_local) = instr("A");
+    let (local, exp_local) = in_process_instr("A");
 
     dist.enable(&["nesting::parent", "nesting::child"]).unwrap();
     local
@@ -874,8 +823,8 @@ fn a_distributed_and_an_in_process_instrumentation_stay_isolated() {
         "the in-process one is untouched by the distributed span in the ambient slot"
     );
 
-    // The in-process child parents to the in-process parent, not to the
-    // distributed span that was current at the time.
+    // The in-process child parents to the in-process parent, it stays isolated from
+    // the distributed span that was current at the time.
     let local_child = spans_local
         .iter()
         .find(|s| s.name == "nesting::child")
@@ -894,8 +843,8 @@ fn a_distributed_and_an_in_process_instrumentation_stay_isolated() {
 
 #[test]
 fn two_instrumentations_isolate_their_spans_and_traces() {
-    let (a, exp_a) = instr("A");
-    let (b, exp_b) = instr("B");
+    let (a, exp_a) = in_process_instr("A");
+    let (b, exp_b) = in_process_instr("B");
 
     // Overlapping enabled sets: both trace the parent, only A traces the child.
     a.enable(&["nesting::parent", "nesting::child"]).unwrap();
@@ -921,8 +870,8 @@ fn two_instrumentations_isolate_their_spans_and_traces() {
 
 #[test]
 fn each_instrumentation_nests_independently() {
-    let (a, exp_a) = instr("A");
-    let (b, exp_b) = instr("B");
+    let (a, exp_a) = in_process_instr("A");
+    let (b, exp_b) = in_process_instr("B");
 
     // A traces one parent/child pair, B a different one.
     a.enable(&["nesting::parent", "nesting::child"]).unwrap();
@@ -948,10 +897,10 @@ fn each_instrumentation_nests_independently() {
 
 #[test]
 fn the_same_function_traced_by_two_instrumentations_yields_separate_traces() {
-    let (a, exp_a) = instr("A");
-    let (b, exp_b) = instr("B");
+    let (a, exp_a) = in_process_instr("A");
+    let (b, exp_b) = in_process_instr("B");
 
-    // The same function enabled in both -- each produces its own span in its
+    // The same function enabled in both: each produces its own span in its
     // own tracer/backend, in its own trace.
     a.enable(&["nesting::parent"]).unwrap();
     b.enable(&["nesting::parent"]).unwrap();
@@ -973,7 +922,7 @@ fn the_same_function_traced_by_two_instrumentations_yields_separate_traces() {
 
 #[test]
 fn dropping_an_instrumentation_stops_new_spans_and_frees_its_slot() {
-    let (a, exp_a) = instr("A");
+    let (a, exp_a) = in_process_instr("A");
     a.enable(&["nesting::parent"]).unwrap();
     let _ = parent();
     assert_eq!(exp_a.get_finished_spans().unwrap().len(), 1);
@@ -986,9 +935,9 @@ fn dropping_an_instrumentation_stops_new_spans_and_frees_its_slot() {
         "no new spans for a dropped instrumentation's slot"
     );
 
-    // A fresh instrumentation still allocates cleanly and works -- and since the
-    // dropped one released its slot, this may well be the very same slot.
-    let (c, exp_c) = instr("C");
+    // A fresh instrumentation still allocates cleanly and works, and since the
+    // dropped one released its slot, this may be the same slot.
+    let (c, exp_c) = in_process_instr("C");
     c.enable(&["nesting::parent"]).unwrap();
     let _ = parent();
     assert_eq!(exp_c.get_finished_spans().unwrap().len(), 1);
@@ -996,11 +945,11 @@ fn dropping_an_instrumentation_stops_new_spans_and_frees_its_slot() {
 
 #[test]
 fn slots_are_reused_so_churn_does_not_exhaust_them() {
-    // Build and drop well past MAX_INSTRUMENTATIONS one at a time. With a bump
+    // Build and drop past MAX_INSTRUMENTATIONS one at a time. With a bump
     // allocator this would fail partway through; with slot reuse it can't.
     let total = opentelemetry_traceable::instrumentation::MAX_INSTRUMENTATIONS * 3;
     for i in 0..total {
-        let (one, exporter) = instr("churn");
+        let (one, exporter) = in_process_instr("churn");
         one.enable(&["nesting::child"]).unwrap();
         let _ = child();
         assert_eq!(
@@ -1013,7 +962,7 @@ fn slots_are_reused_so_churn_does_not_exhaust_them() {
 
 #[tokio::test]
 async fn instrumentation_works_across_await_points() {
-    let (a, exp_a) = instr("A");
+    let (a, exp_a) = in_process_instr("A");
     a.enable(&["shared::async_root", "shared::async_leaf"])
         .unwrap();
 

@@ -82,19 +82,19 @@ impl std::fmt::Display for UnknownKeys {
 
 impl std::error::Error for UnknownKeys {}
 
-/// Resolve `selectors` -- exact registry keys, `*` patterns, or a mix -- against
-/// every `#[traceable]` function linked into this binary.
+/// Resolve `selectors`:
 ///
-/// Selectors are trimmed, and blank ones are ignored. Nothing is applied here,
-/// which also makes this the dry-run entry point: resolve first to preview what a
-/// pattern would select. To apply a selection, hand the selectors to
-/// [`Instrumentation::set_enabled`](crate::instrumentation::Instrumentation::set_enabled)
-/// and friends.
+///  * exact registry keys
+///  * `*` patterns
+///  * mix of the above
+///
+/// against every `#[traceable]` function linked into this binary.
+///
+/// Unmatched *patterns* are returned in [`Selection::unmatched_patterns`].
 ///
 /// # Errors
 ///
-/// [`UnknownKeys`] if any *exact* selector matches no function. Unmatched *patterns*
-/// come back in [`Selection::unmatched_patterns`] instead.
+/// [`UnknownKeys`] if any *exact* selector matches no function.
 pub fn resolve<S: AsRef<str>>(selectors: &[S]) -> Result<Selection, UnknownKeys> {
     let keys = registry::keys();
     let mut matched: Vec<&'static str> = Vec::new();
@@ -107,16 +107,13 @@ pub fn resolve<S: AsRef<str>>(selectors: &[S]) -> Result<Selection, UnknownKeys>
             continue;
         }
         if is_pattern(selector) {
-            // Comparing lengths is a sound "matched nothing" test even when an
-            // earlier selector already covered the same keys: duplicates are
-            // pushed here and only collapsed once, at the end.
             let before = matched.len();
             matched.extend(keys.iter().copied().filter(|key| matches(selector, key)));
             if matched.len() == before {
                 unmatched_patterns.push(selector.to_string());
             }
         } else {
-            // `keys` is sorted, so an exact selector is one binary search.
+            // `keys` is sorted
             match keys.binary_search_by(|candidate| (**candidate).cmp(selector)) {
                 Ok(at) => matched.push(keys[at]),
                 Err(_) => unknown.push(selector.to_string()),
@@ -124,7 +121,6 @@ pub fn resolve<S: AsRef<str>>(selectors: &[S]) -> Result<Selection, UnknownKeys>
         }
     }
 
-    // All of them, not just the first -- one save should surface every typo.
     if !unknown.is_empty() {
         return Err(UnknownKeys { keys: unknown });
     }

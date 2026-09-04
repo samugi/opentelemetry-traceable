@@ -79,7 +79,6 @@ fn bench_traceable_overhead(c: &mut Criterion) {
         .with_simple_exporter(exporter1)
         .build();
     let instr1 = Instrumentation::builder()
-        .name("bench-1")
         .tracer(provider1.tracer("bench-1"))
         .build()
         .expect("a free instrumentation slot");
@@ -98,7 +97,6 @@ fn bench_traceable_overhead(c: &mut Criterion) {
         .with_simple_exporter(exporter2)
         .build();
     let instr2 = Instrumentation::builder()
-        .name("bench-2")
         .tracer(provider2.tracer("bench-2"))
         .build()
         .expect("a free instrumentation slot");
