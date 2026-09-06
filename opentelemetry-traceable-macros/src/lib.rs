@@ -1,12 +1,17 @@
 //! Proc-macro implementation of `#[traceable]`.
 //!
-//! Uses an `#[in_span]`-style argument surface (`name`,
-//! `fields(key = expr, ...)`), but gates span creation behind a per-function
-//! bitmask discovered at link time via `linkme` (one bit per
-//! `opentelemetry_traceable::instrumentation` slot), so tracing can be toggled per function --
-//! and per instrumentation -- at runtime without recompiling. There is no
-//! `tracer` argument: each instrumentation brings its own tracer, so a call site
-//! has nothing to name.
+//! Instruments a function and makes it "traceable". Traceable
+//! functions (aka trace sites) can be dynamically enabled or
+//! disabled to turn tracing on and off on a per-function basis.
+//!
+//! Span creation is controlled via a per-function bitmask that enables
+//! multiple instrumentations to coexist and produce different trace
+//! shapes/hierarchies (a function may produce a span for a given
+//! instrumentation and not for another). This way, tracing can be
+//! controller per-function and per-instrumentation, at runtime.
+//!
+//! The `traceable` macro allows configuring certain parameters of
+//! the trace site, such as the span name and attributes.
 //!
 //! Important: expanded macros only depend on `opentelemetry` via the
 //! re-exported ::opentelemetry_traceable::opentelemetry namespace.
@@ -99,16 +104,16 @@ impl Parse for TraceableArgs {
 
 /// Marks a `fn` or `async fn` as a candidate for tracing.
 ///
-/// Every call checks a per-function, link-time-registered bitmask before doing
-/// any span/context work, so a function no instrumentation is tracing costs a
-/// single atomic load. Enable it at runtime through a
-/// `opentelemetry_traceable::instrumentation::Instrumentation`, which supplies the tracer the
-/// span is created from — the macro itself never names or looks up a tracer.
+/// Every call checks a per-function bitmask before creating any span.
+/// A disabled trace site has the cost of one atomic load.
+///
+/// Enable it at runtime through a
+/// `opentelemetry_traceable::instrumentation::Instrumentation`.
 ///
 /// The registry key used to enable a function defaults to
-/// `module_path!() + "::" + fn_name`, or the `name` argument if given. Note the
-/// key is not qualified by the surrounding `impl` type, so two methods with the
-/// same name in the same module share a key unless `name` disambiguates them.
+/// `module_path!() + "::" + fn_name`, or the `name` argument if given.
+/// Note: two methods with the same name in the same module share a key
+/// unless `name` is used to distinguish them.
 ///
 /// ```ignore
 /// #[traceable]
@@ -120,11 +125,6 @@ impl Parse for TraceableArgs {
 /// #[traceable(fields("component" = "proxy", request_id = id))]
 /// async fn handle(id: String) { }
 /// ```
-///
-/// Where the span hangs is decided by the instrumentation, not here: an
-/// in-process one parents within its own hierarchy, a distributed one parents to
-/// whatever span is current (including one extracted from an incoming
-/// `traceparent`).
 #[proc_macro_attribute]
 pub fn traceable(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as TraceableArgs);
@@ -152,8 +152,6 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
         None => quote! { ::std::concat!(::std::module_path!(), "::", #fn_ident_str) },
     };
 
-    // The `fields(...)` as `KeyValue` expressions, handed to `start_spans` so
-    // every active instrumentation stamps the same attributes on its own span.
     let kvs: Vec<TokenStream2> = args
         .fields
         .iter()
@@ -166,8 +164,7 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
 
     // `start_spans` builds one child span per active slot (with that slot's own
     // tracer and parent) and hands back the single context to attach, or `None`
-    // if no span was created -- every active slot's instrumentation was dropped
-    // mid-flight.
+    // if no span was created.
     let traced = if is_async {
         quote! {
             ::opentelemetry_traceable::opentelemetry::trace::FutureExt::with_context(async #block, __traceable_cx).await
@@ -181,8 +178,8 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
         }
     };
 
-    // Fast-path dispatch on the enabled bitmask:
-    //   0 -> no instrumentation is tracing this function; run the body raw,
+    // Check the bitmask to add zero overhead where possible:
+    //   0 -> no instrumentation is tracing this function: run the raw body,
     //        having paid a single atomic load.
     //   _ -> at least one is; build a span per active slot.
     quote! {

@@ -1,13 +1,12 @@
 # opentelemetry-traceable
 
-Dynamic, per-function tracing on top of [`opentelemetry-rust`](https://github.com/open-telemetry/opentelemetry-rust).
-Annotate any `fn`/`async fn` with `#[traceable]`, then enable or disable tracing for it at
-runtime — individually, in bulk, or as an arbitrary subset of tens of thousands of functions —
-without recompiling.
+Dynamic, per-function multi-instrumentation tracing on top of [`opentelemetry-rust`](https://github.com/open-telemetry/opentelemetry-rust).
+Annotate any `fn`/`async fn` with `#[traceable]`, then enable or disable tracing for them at
+runtime, individually (by exact name), or in bulk (using patterns).
 
 ## Quick start
 
-Annotate the functions you might one day want traced:
+Annotate the functions you may want to trace:
 
 ```rust
 use opentelemetry_traceable::traceable;
@@ -15,18 +14,15 @@ use opentelemetry_traceable::traceable;
 #[traceable]
 fn process() { /* ... */ }
 
-#[traceable(name = "kafka.fetch")]
+#[traceable(name = "data.fetch")]
 async fn fetch() { /* ... */ }
 
 #[traceable(fields("component" = "proxy", "request_id" = id.clone()))]
 async fn handle(id: String) { /* ... */ }
 ```
 
-Nothing traces yet. An **`Instrumentation`** is the only way to turn tracing on — there is no
-global or default instrumentation, and no process-wide tracer. Each `Instrumentation` brings its
-own `Tracer`, holds its own enabled subset, and builds its own isolated span hierarchy.
-
-Use the re-exported opentelemetry modules to access functionality such as `sdk` and `otlp`:
+Tracing is controlled using an **`Instrumentation`**. Each `Instrumentation` brings its
+own `Tracer`, and configures an _enabled subset_ of functions, thus controlling its own trace shape. This means `Instrumentations` are isolated, so that it's possible to produce multiple concurrent and different traces off of the same function set, which are each treated individually during export, thanks to the dedicated `Tracers`.
 
 ```rust
 use opentelemetry_traceable::opentelemetry::trace::TracerProvider as _;
@@ -44,48 +40,20 @@ let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
     .build();
 
 let instr = Instrumentation::builder()
-    .name("checkout-debug")                     // diagnostic only
-    .tracer(provider.tracer("checkout-debug"))  // any opentelemetry Tracer; required
-    .build()?;                                  // Err(BuildError) if no slot is free
+    .tracer(provider.tracer("checkout-debug"))
+    .build()?;
 
-instr.set_enabled(&["my_crate::checkout::*"])?; // keys and/or globs — see "Selecting functions"
+instr.set_enabled(&["my_crate::checkout::*"])?;
 ```
 
-`opentelemetry` is re-exported as `opentelemetry_traceable::opentelemetry` rather than being a
-dependency you add yourself: `#[traceable]`'s expansion and `Instrumentation::tracer`/`Context`/
-`KeyValue` all need to resolve to the _exact same_ `opentelemetry` this crate was built against,
-and re-exporting it makes that structurally guaranteed instead of something you have to keep
-your own `Cargo.toml` in sync with. `linkme` gets the same treatment, hidden, since the macro is
-its only caller. Whatever `Tracer` implementation you build `provider` from (`opentelemetry_sdk`
-above, or another backend) remains your own dependency — this crate has no opinion on it.
-
-Dropping `instr` stops new spans for it and releases its slot for reuse; spans already in flight
-finish and export normally.
-
 Every `#[traceable]` function is disabled for every instrumentation by default. When no
-instrumentation is tracing a function, a call costs a single atomic load — no span, no
-`opentelemetry::Context` work at all. When at least one is, the macro builds one child span per
-active instrumentation and attaches a single context for the wrapped call (attach/detach for sync,
-`FutureExt::with_context` across `.await` for async), so parent/child nesting is automatic,
-including across `.await` points.
+instrumentation is tracing a function, a call costs a single atomic load.
 
-An instrumentation is **in-process** by default: its spans nest under each other and nowhere else.
-Add `.distributed()` to the builder for one that joins an incoming `traceparent` and is carried
-outbound by a propagator — see
+An instrumentation is **in-process** by default: its spans hierarchy is isolated, and a span can only be the child of another span within the same `in-process` `Instrumentation`.
+
+A `distributed` `Instrumentation` can be obtained by adding `.distributed()` to the builder.
+The `distributed` `Instrumentation` is unique, global, it interacts with OpenTelemetry's `current` Context, so it can join a propagated Context (e.g. via `traceparent`). See
 [In-process and distributed instrumentations](#in-process-and-distributed-instrumentations).
-
-Disabling a function only skips _its own_ span — an enabled function still nests under the nearest
-recording ancestor span **of the same instrumentation**, whether or not everything in between is
-enabled.
-
-A function's **registry key** — the string it's listed under, and the thing you configure by —
-defaults to `module_path!() + "::" + fn_name`, or the `name` argument if given. It's the whole
-identity of a trace site: there is no id or index, and nothing is addressed by position. Note it
-isn't qualified by a surrounding `impl` type — two methods with the same name in the same module
-share a key, and therefore toggle together, unless `name` disambiguates them.
-
-The macro takes only `name` and `fields(...)`. There is deliberately no `tracer` argument: a call
-site never names or looks up a tracer, because each instrumentation supplies its own.
 
 ## Configuring an instrumentation
 
