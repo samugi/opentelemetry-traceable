@@ -1,8 +1,7 @@
 # opentelemetry-traceable
 
-Dynamic, per-function multi-instrumentation tracing on top of [`opentelemetry-rust`](https://github.com/open-telemetry/opentelemetry-rust).
-Annotate any `fn`/`async fn` with `#[traceable]`, then enable or disable tracing for them at
-runtime, individually (by exact name), or in bulk (using patterns).
+Fast, per-function, multi-instrumentation tracing on top of [`opentelemetry-rust`](https://github.com/open-telemetry/opentelemetry-rust).
+Allows generating multiple, independent traces where each span can be enabled/disabled at runtime.
 
 ## Quick start
 
@@ -22,7 +21,7 @@ async fn handle(id: String) { /* ... */ }
 ```
 
 Tracing is controlled using an **`Instrumentation`**. Each `Instrumentation` brings its
-own `Tracer`, and configures an _enabled subset_ of functions, thus controlling its own trace shape. This means `Instrumentations` are isolated, so that it's possible to produce multiple concurrent and different traces off of the same function set, which are each treated individually during export, thanks to the dedicated `Tracers`.
+own `Tracer`, and configures an _enabled subset_ of functions, thus controlling its own trace shape. `Instrumentations` are therefore isolated, and it's possible to produce multiple concurrent and different traces off of the same function set, which are treated independently during export.
 
 ```rust
 use opentelemetry_traceable::opentelemetry::trace::TracerProvider as _;
@@ -46,48 +45,27 @@ let instr = Instrumentation::builder()
 instr.set_enabled(&["my_crate::checkout::*"])?;
 ```
 
-Every `#[traceable]` function is disabled for every instrumentation by default. When no
-instrumentation is tracing a function, a call costs a single atomic load.
+## Performance
 
-An instrumentation is **in-process** by default: its spans hierarchy is isolated, and a span can only be the child of another span within the same `in-process` `Instrumentation`.
+Every `#[traceable]` function is disabled for every instrumentation by default. When no instrumentation is tracing a function, the annotation costs a single atomic load. The overhead is dominated by span creation, so for a given function, it is proportional to the number of instrumentations that `enable` that function.
 
-A `distributed` `Instrumentation` can be obtained by adding `.distributed()` to the builder.
-The `distributed` `Instrumentation` is unique, global, it interacts with OpenTelemetry's `current` Context, so it can join a propagated Context (e.g. via `traceparent`). See
-[In-process and distributed instrumentations](#in-process-and-distributed-instrumentations).
-
-## Configuring an instrumentation
-
-An instrumentation is configured by **listing the functions it should trace**.
-This can be done by registry keys, or `*` patterns.
-
-```rust
-// replace the enabled set with the newly provided one
-instr.set_enabled(&["my_crate::checkout"])?;
-// add the provided pattern to the previously enabled set
-instr.enable(&["my_crate::db::*"])?;
+```
+Benchmark                      Mean (ns)
+------------------------------ ---------
+no_macro                          854.05
+one_disabled                      856.19
+one_enabled                      1209.67
+tracing_instrument_disabled       963.46
+tracing_instrument_enabled       1883.93
 ```
 
-### Running several at once
-
-Several instrumentations can be enabled and run together.
-Each builds a fully independent trace from the same call chain.
-
-There is a limit of `64` max instrumentations: this limits how many instrumentations can be **live at once**.
+Benchmarked with Criterion. `no_macro` is the uninstrumented baseline, `one_enabled`/`one_disabled` show #[traceable] overhead with a single instrumentation toggled on/off, compared against tracing's #[instrument] macro under similar conditions.
 
 ## In-process and distributed instrumentations
 
-### In-process (default)
+An instrumentation is **in-process** by default: `in-process` `Instrumentations` are isolated, their spans can only be child of another span within the same `in-process` `Instrumentation`. Many `in-process` `Instrumentations` can coexist.
 
-Completely isolated and not resumable
-
-- **An inbound (propagated) `Context` cannot be joined.**
-- **A trace created outside opentelemetry-traceable is never joined**.
-- **Outbound requests carry no `Context`**.
-
-An in-process instrumentation's spans nest only under other `#[traceable]` spans of that _same_
-instrumentation.
-
-### Distributed (at most one)
+A `distributed` `Instrumentation` can be obtained by adding `.distributed()` to the builder.
 
 ```rust
 let edge = Instrumentation::builder()
@@ -97,14 +75,7 @@ let edge = Instrumentation::builder()
     .build()?;
 ```
 
-A distributed instrumentation uses the current `Context`'s span slot. Its span
-becomes a child of whatever span is "current", so propagators are compatible with this
-instrumentation as they interact with the `span` field of the current `Context`.
-
-For propagation to work, your application must extract and inject from/to `Context::current`,
-and `#[traceable]` spans join the trace like any other spans.
-
-Because distributed instrumentations are global, only one can exist at a time.
+Unlike `in-process`, the `distributed` `Instrumentation` is unique, global, it interacts with OpenTelemetry's `current` Context, so it can join a propagated Context (e.g. via `traceparent`). Because distributed instrumentations are global, only one can exist at a time.
 
 ## Selecting functions by key
 
