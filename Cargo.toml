@@ -3,8 +3,11 @@ resolver = "2"
 members = ["opentelemetry-traceable", "opentelemetry-traceable-macros"]
 
 [workspace.package]
+name = "opentelemetry_traceable"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Per-function, multi-instrumentation, dynamically-configurable tracing library on top of opentelemetry-rust"
 
 [workspace.dependencies]
 proc-macro2 = "1"
