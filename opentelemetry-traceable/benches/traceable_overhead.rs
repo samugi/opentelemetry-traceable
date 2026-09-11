@@ -11,10 +11,11 @@
 // `criterion_group!` expands to an undocumented public `benches` fn.
 #![allow(missing_docs)]
 
+use std::hint::black_box;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracer, SdkTracerProvider};
 use opentelemetry_traceable::instrumentation::Instrumentation;
