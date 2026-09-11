@@ -1,5 +1,5 @@
 [tools]
-"cargo:cargo-nextest" = { version = "0.9.143" }
+"cargo:cargo-nextest" = { version = "0.9.144" }
 
 [tasks.test]
 description = "Run all tests using cargo-nextest"
