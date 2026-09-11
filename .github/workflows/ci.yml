@@ -1,3 +1,5 @@
+# CI tasks for opentelemetry-traceable.
+
 name: CI
 
 on:
@@ -24,8 +26,13 @@ jobs:
         with:
           components: rustfmt
 
+      - name: Install mise (and tools)
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+        with:
+          install: true
+
       - name: Run rustfmt
-        run: cargo fmt --all -- --check
+        run: mise run "fmt:*"
 
   rust-clippy:
     name: Run clippy checks
@@ -39,14 +46,13 @@ jobs:
         with:
           components: clippy
 
+      - name: Install mise (and tools)
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+        with:
+          install: true
+
       - name: Run clippy
-        run: >-
-          cargo clippy --locked --workspace --all-targets --all-features --
-          -D warnings
-          -W missing_debug_implementations
-          -W missing_docs
-          -W unsafe_code
-          -W clippy::undocumented_unsafe_blocks
+        run: mise run "lint:*"
 
   rust-doc:
     name: Run rustdoc checks
@@ -58,8 +64,13 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
+      - name: Install mise (and tools)
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+        with:
+          install: true
+
       - name: Run rustdoc
-        run: cargo doc --locked --workspace --keep-going --no-deps
+        run: mise run doc
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -73,13 +84,13 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
-      - name: Install mise (and cargo-nextest via mise)
+      - name: Install mise (and tools)
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
         with:
           install: true
 
       - name: Run cargo build
-        run: cargo build --locked --workspace
+        run: mise run build
 
       - name: Run cargo nextest (with mise)
-        run: mise run test
+        run: mise run "test:*"
