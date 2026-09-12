@@ -7,6 +7,8 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Per-function, multi-instrumentation, dynamically-configurable tracing library on top of opentelemetry-rust"
+readme = "README.md"
+repository = "https://github.com/samugi/opentelemetry-traceable"
 
 [workspace.dependencies]
 proc-macro2 = "1"
