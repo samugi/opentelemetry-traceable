@@ -14,7 +14,7 @@ linkme = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
-opentelemetry-traceable-macros = { path = "../opentelemetry-traceable-macros", version = "0.1.0" }
+opentelemetry-traceable-macros = { path = "../opentelemetry-traceable-macros", version = "0.1.1" }
 smallvec = { workspace = true }
 
 # dev dependencies, sorted alphabetically
