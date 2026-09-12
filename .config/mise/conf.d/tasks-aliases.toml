@@ -1,0 +1,11 @@
+[tasks.lint]
+description = "Run all lint tasks"
+depends = ['lint:**']
+
+[tasks.test]
+description = "Run all test tasks"
+depends = ['test:**']
+
+[tasks.fmt]
+description = "Run all fmt tasks"
+depends = ['fmt:**']
