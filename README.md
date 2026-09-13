@@ -43,7 +43,7 @@ instr.set_enabled(&["*::process", "checkout"])?;
 cargo run --example basic -p opentelemetry-traceable
 ```
 
-Check out the [`examples`](./opentelemetry-traceable/examples) directory.
+Check out the [`examples`](https://github.com/samugi/opentelemetry-traceable/tree/main/opentelemetry-traceable/examples) directory.
 
 ## Performance
 
