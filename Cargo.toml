@@ -16,8 +16,9 @@ quote = "1"
 syn = { version = "2", features = ["full"] }
 linkme = "0.3"
 opentelemetry = { version = "0.32", features = ["trace"] }
-opentelemetry_sdk = { version = "0.32", features = ["trace", "testing"] }
 opentelemetry-otlp = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["trace", "testing"] }
+opentelemetry-stdout = "0.32"
 tokio = { version = "1", features = ["full"] }
 arc-swap = "1"
 smallvec = "1"

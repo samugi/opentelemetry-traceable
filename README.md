@@ -8,42 +8,42 @@ Allows generating multiple, independent traces where each span can be enabled/di
 Annotate the functions you may want to trace:
 
 ```rust
-use opentelemetry_traceable::traceable;
-
 #[traceable]
 fn process() { /* ... */ }
 
-#[traceable(name = "data.fetch")]
-async fn fetch() { /* ... */ }
-
-#[traceable(fields("component" = "proxy", "request_id" = id.clone()))]
-async fn handle(id: String) { /* ... */ }
+#[traceable(name = "checkout")]
+async fn checkout_order() { /* ... */ }
 ```
 
-Tracing is controlled using an **`Instrumentation`**. Each `Instrumentation` brings its
-own `Tracer`, and configures an _enabled subset_ of functions, thus controlling its own trace shape. `Instrumentations` are therefore isolated, and it's possible to produce multiple concurrent and different traces off of the same function set, which are treated independently during export.
+Now tracing can be enabled individually for the `process` and `checkout_order` functions, at runtime.
+
+Tracing is controlled using an **`Instrumentation`**.
+
+Each `Instrumentation` binds:
+
+1. A `Tracer`, which controls how the Instrumentation's traces are exported
+2. An **enabled set** of functions, which controls the shape of this Instrumentation's traces
+
+`Instrumentations` are isolated: it's possible to produce multiple/different traces off of the same function set by enabling different subsets of functions in different Instrumentations.
 
 ```rust
-use opentelemetry_traceable::opentelemetry::trace::TracerProvider as _;
-use opentelemetry_traceable::instrumentation::Instrumentation;
-use opentelemetry_traceable::opentelemetry_otlp::{self, WithExportConfig};
-use opentelemetry_traceable::opentelemetry_sdk;
-
-let exporter = opentelemetry_otlp::SpanExporterBuilder::default()
-    .with_http()
-    .with_endpoint("http://localhost:4317")
-    .build()
-    .unwrap();
-let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-    .with_simple_exporter(exporter)
-    .build();
-
 let instr = Instrumentation::builder()
     .tracer(provider.tracer("checkout-debug"))
     .build()?;
 
-instr.set_enabled(&["my_crate::checkout::*"])?;
+// the `process` function uses the default key: `my-crate::my-module::process`
+// while `checkout_order` was renamed to `checkout` so it can be enabled
+// without using a pattern:
+instr.set_enabled(&["*::process", "checkout"])?;
 ```
+
+### Test it out
+
+```
+cargo run --example basic -p opentelemetry-traceable
+```
+
+Check out the [`examples`](./opentelemetry-traceable/examples) directory.
 
 ## Performance
 

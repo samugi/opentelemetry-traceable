@@ -12,10 +12,6 @@
 //!
 //! The `traceable` macro allows configuring certain parameters of
 //! the trace site, such as the span name and attributes.
-//!
-//! Important: expanded macros only depend on `opentelemetry` via the
-//! re-exported ::opentelemetry_traceable::opentelemetry namespace.
-//! Additional dependencies need to be handled appropriately by adapting manifest files.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -158,7 +154,7 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
         .flatten()
         .map(|f| {
             let (key, value) = (&f.key, &f.value);
-            quote! { ::opentelemetry_traceable::opentelemetry::KeyValue::new(#key, #value) }
+            quote! { opentelemetry::KeyValue::new(#key, #value) }
         })
         .collect();
 
@@ -167,7 +163,7 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
     // if no span was created.
     let traced = if is_async {
         quote! {
-            ::opentelemetry_traceable::opentelemetry::trace::FutureExt::with_context(async #block, __traceable_cx).await
+            opentelemetry::trace::FutureExt::with_context(async #block, __traceable_cx).await
         }
     } else {
         quote! {
