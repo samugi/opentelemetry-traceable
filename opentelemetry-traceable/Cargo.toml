@@ -12,7 +12,7 @@ readme = { workspace = true }
 arc-swap = { workspace = true }
 linkme = { workspace = true }
 opentelemetry = { workspace = true }
-opentelemetry-traceable-macros = { path = "../opentelemetry-traceable-macros", version = "0.1.1" }
+opentelemetry-traceable-macros = { path = "../opentelemetry-traceable-macros", version = "0.2.0" }
 smallvec = { workspace = true }
 
 # dev dependencies, sorted alphabetically
