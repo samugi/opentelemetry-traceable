@@ -8,14 +8,7 @@ pub mod instrumentation;
 pub mod registry;
 pub mod selector;
 
-pub use opentelemetry;
 pub use opentelemetry_traceable_macros::traceable;
-
-#[cfg(feature = "sdk")]
-pub use opentelemetry_sdk;
-
-#[cfg(feature = "otlp")]
-pub use opentelemetry_otlp;
 
 #[doc(hidden)]
 pub mod __private {

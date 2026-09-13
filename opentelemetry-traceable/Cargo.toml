@@ -12,15 +12,16 @@ readme = { workspace = true }
 arc-swap = { workspace = true }
 linkme = { workspace = true }
 opentelemetry = { workspace = true }
-opentelemetry-otlp = { workspace = true, optional = true }
-opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-traceable-macros = { path = "../opentelemetry-traceable-macros", version = "0.1.1" }
 smallvec = { workspace = true }
 
 # dev dependencies, sorted alphabetically
 [dev-dependencies]
 criterion = { workspace = true }
-opentelemetry-traceable = { path = ".", features = ["otlp"] }
+opentelemetry-traceable = { path = "." }
+opentelemetry-otlp = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-stdout = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
@@ -29,8 +30,3 @@ tracing-subscriber = { workspace = true }
 [[bench]]
 name = "traceable_overhead"
 harness = false
-
-[features]
-default = []
-sdk  = ["dep:opentelemetry_sdk"]
-otlp = ["dep:opentelemetry-otlp", "sdk"]
