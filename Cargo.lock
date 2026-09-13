@@ -771,7 +771,7 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-traceable"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "criterion",
@@ -791,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-traceable-macros"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "opentelemetry",
  "proc-macro2",
