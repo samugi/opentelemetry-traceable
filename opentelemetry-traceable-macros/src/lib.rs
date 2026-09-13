@@ -154,7 +154,7 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
         .flatten()
         .map(|f| {
             let (key, value) = (&f.key, &f.value);
-            quote! { opentelemetry::KeyValue::new(#key, #value) }
+            quote! { ::opentelemetry::KeyValue::new(#key, #value) }
         })
         .collect();
 
@@ -163,7 +163,7 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
     // if no span was created.
     let traced = if is_async {
         quote! {
-            opentelemetry::trace::FutureExt::with_context(async #block, __traceable_cx).await
+            ::opentelemetry::trace::FutureExt::with_context(async #block, __traceable_cx).await
         }
     } else {
         quote! {
