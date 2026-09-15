@@ -13,7 +13,7 @@ repository = "https://github.com/samugi/opentelemetry-traceable"
 [workspace.dependencies]
 proc-macro2 = "1"
 quote = "1"
-syn = { version = "2", features = ["full"] }
+syn = { version = "3", features = ["full"] }
 linkme = "0.3"
 opentelemetry = { version = "0.32", features = ["trace"] }
 opentelemetry-otlp = "0.32"
