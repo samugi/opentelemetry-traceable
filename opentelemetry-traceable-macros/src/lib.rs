@@ -134,6 +134,7 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
         vis,
         sig,
         block,
+        modifiers: _,
     } = func;
     let fn_ident_str = sig.ident.to_string();
     let is_async = sig.asyncness.is_some();
