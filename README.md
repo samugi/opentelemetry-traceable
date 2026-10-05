@@ -89,6 +89,20 @@ my_app::domain::db::*   matches  my_app::domain::db::query
 *                       matches  everything
 ```
 
+## Trace-site docs
+
+`registry::sites()` reports every `#[traceable]` site in the binary: its registry key and its `doc`, together:
+
+```rust
+for site in opentelemetry_traceable::registry::sites() {
+    println!("{} — {}", site.key, site.doc);
+}
+```
+
+Give a site a short description with `#[traceable(doc = "...")]`. It is static data in the registry: it costs nothing until read.
+
+Guideline: when a traceable function has traceable parents or children, say so in its `doc` (e.g. "called by checkout; calls db::query and email::send"). Whoever builds enabled sets (a person, a script, ...) uses that to pick subsets whose spans nest correctly.
+
 ## Development
 
 Tooling is managed with [`mise`](https://mise.jdx.dev/) (config at `.config/mise/config.toml`):

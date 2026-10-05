@@ -18,7 +18,7 @@ fn bar() {
     thread::sleep(Duration::from_secs(1));
 }
 
-#[traceable(name = "renamed-baz", fields("component" = "proxy", "request_id" = 123))]
+#[traceable(name = "renamed-baz", fields("component" = "proxy", "request_id" = 123), doc = "the renamed one: shows name, fields and doc together")]
 fn baz() {
     thread::sleep(Duration::from_secs(1));
 }

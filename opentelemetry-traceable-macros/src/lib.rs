@@ -59,6 +59,7 @@ impl Parse for Field {
 struct TraceableArgs {
     name: Option<LitStr>,
     fields: Option<Vec<Field>>,
+    doc: Option<LitStr>,
 }
 
 impl Parse for TraceableArgs {
@@ -81,6 +82,13 @@ impl Parse for TraceableArgs {
                         content.parse_terminated(Field::parse, Token![,])?;
                     if args.fields.replace(parsed.into_iter().collect()).is_some() {
                         return Err(syn::Error::new(ident.span(), "duplicate `fields` argument"));
+                    }
+                }
+                "doc" => {
+                    input.parse::<Token![=]>()?;
+                    let lit: LitStr = input.parse()?;
+                    if args.doc.replace(lit).is_some() {
+                        return Err(syn::Error::new(ident.span(), "duplicate `doc` argument"));
                     }
                 }
                 other => {
@@ -111,6 +119,15 @@ impl Parse for TraceableArgs {
 /// Note: two methods with the same name in the same module share a key
 /// unless `name` is used to distinguish them.
 ///
+/// The `doc` argument adds a short description of the trace site, readable
+/// at runtime through `opentelemetry_traceable::registry::sites` together
+/// with its key. It is static data: it costs nothing until read.
+///
+/// Guideline: when a traceable function has traceable parents or children,
+/// say so in its `doc` (e.g. "called by checkout; calls db::query and
+/// email::send"). Whoever builds enabled sets -- a person, a script, a coding
+/// agent -- uses that to pick subsets whose spans nest correctly.
+///
 /// ```ignore
 /// #[traceable]
 /// fn process() { }
@@ -120,6 +137,9 @@ impl Parse for TraceableArgs {
 ///
 /// #[traceable(fields("component" = "proxy", request_id = id))]
 /// async fn handle(id: String) { }
+///
+/// #[traceable(doc = "waits for one second")]
+/// fn sleep() { }
 /// ```
 #[proc_macro_attribute]
 pub fn traceable(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -175,6 +195,13 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
         }
     };
 
+    // The `doc` argument is stored in the site: static data, readable at
+    // runtime through `registry::sites`.
+    let doc = match &args.doc {
+        Some(lit) => quote! { #lit },
+        None => quote! { "" },
+    };
+
     // Check the bitmask to add zero overhead where possible:
     //   0 -> no instrumentation is tracing this function: run the raw body,
     //        having paid a single atomic load.
@@ -185,7 +212,7 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
             #[::opentelemetry_traceable::__private::linkme::distributed_slice(::opentelemetry_traceable::registry::REGISTRY)]
             #[linkme(crate = ::opentelemetry_traceable::__private::linkme)]
             static __TRACEABLE_SITE: ::opentelemetry_traceable::registry::TraceSite =
-                ::opentelemetry_traceable::registry::TraceSite::new(#registry_key);
+                ::opentelemetry_traceable::registry::TraceSite::new(#registry_key, #doc);
 
             let __traceable_mask =
                 __TRACEABLE_SITE.enabled_slots.load(::std::sync::atomic::Ordering::Relaxed);
