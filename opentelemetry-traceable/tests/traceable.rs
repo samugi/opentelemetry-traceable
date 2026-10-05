@@ -65,6 +65,14 @@ fn named() -> u64 {
     42
 }
 
+#[traceable(
+    name = "doc.site",
+    doc = "called by no one; calls nothing -- it only demonstrates `doc`"
+)]
+fn documented() -> u64 {
+    1
+}
+
 #[traceable(fields("component" = "proxy", "request_id" = id.clone()))]
 fn with_fields(id: String) -> String {
     id
@@ -570,6 +578,30 @@ fn keys_are_the_sorted_deduped_registry_keys() {
         keys.windows(2).all(|pair| pair[0] < pair[1]),
         "keys must be strictly increasing, i.e. sorted and de-duplicated"
     );
+}
+
+#[test]
+fn sites_report_key_and_doc_together() {
+    let sites = opentelemetry_traceable::registry::sites();
+
+    assert_eq!(
+        sites.iter().map(|site| site.key).collect::<Vec<_>>(),
+        opentelemetry_traceable::registry::keys(),
+        "sites() must list the same keys as keys(): sorted and de-duplicated"
+    );
+
+    let doc_site = sites
+        .iter()
+        .find(|site| site.key == "doc.site")
+        .expect("the documented fixture site is registered");
+    assert!(doc_site.doc.contains("demonstrates"));
+    let _ = documented();
+
+    let undocumented = sites
+        .iter()
+        .find(|site| site.key == "custom.span")
+        .expect("the named fixture site is registered");
+    assert_eq!(undocumented.doc, "", "no `doc` argument means an empty doc");
 }
 
 // --- In-process kind: `Context`'s span slot is never read or written --------
