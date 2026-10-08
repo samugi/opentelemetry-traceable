@@ -39,7 +39,7 @@ impl TraceSite {
 pub static REGISTRY: [TraceSite] = [..];
 
 /// One trace site as reported by [`sites`]: its registry key and its doc.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct SiteInfo {
     /// The registry key used to enable/disable this site.
     pub key: &'static str,
