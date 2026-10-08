@@ -604,6 +604,36 @@ fn sites_report_key_and_doc_together() {
     assert_eq!(undocumented.doc, "", "no `doc` argument means an empty doc");
 }
 
+#[test]
+fn sites_serialize_to_plain_name_and_doc_json() {
+    let json = serde_json::to_string(&opentelemetry_traceable::registry::sites())
+        .expect("site list serializes");
+
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid JSON");
+    assert!(
+        !parsed.is_empty(),
+        "the test binary registers fixture sites"
+    );
+    for site in &parsed {
+        let obj = site.as_object().expect("each site is a JSON object");
+        assert_eq!(obj.len(), 2, "each site serializes exactly key and doc");
+        assert!(obj["key"].is_string(), "key serializes as a string");
+        assert!(obj["doc"].is_string(), "doc serializes as a string");
+    }
+
+    let doc_site = parsed
+        .iter()
+        .find(|site| site["key"] == "doc.site")
+        .expect("the documented fixture site is registered");
+    assert!(
+        doc_site["doc"]
+            .as_str()
+            .expect("string")
+            .contains("demonstrates"),
+        "the doc lands on the wire verbatim"
+    );
+}
+
 // --- In-process kind: `Context`'s span slot is never read or written --------
 
 #[test]

@@ -789,6 +789,8 @@ dependencies = [
  "opentelemetry-traceable",
  "opentelemetry-traceable-macros",
  "opentelemetry_sdk",
+ "serde",
+ "serde_json",
  "smallvec",
  "tokio",
  "tracing",
