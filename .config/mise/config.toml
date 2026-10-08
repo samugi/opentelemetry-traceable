@@ -1,2 +1,2 @@
 [tools]
-"cargo:cargo-nextest" = { version = "0.9.146" }
+"cargo:cargo-nextest" = { version = "0.9.148" }
