@@ -80,6 +80,9 @@ const _: () = assert!(
     "MAX_INSTRUMENTATIONS must equal the number of bits in a site's mask"
 );
 
+/// Span registry key as a span attribute
+pub const TRACEABLE_KEY_ATTRIBUTE: &str = "traceable.key";
+
 fn span_builder(name: &'static str, attrs: &[KeyValue]) -> SpanBuilder {
     if attrs.is_empty() {
         SpanBuilder::from_name(name)
@@ -93,6 +96,8 @@ fn span_builder(name: &'static str, attrs: &[KeyValue]) -> SpanBuilder {
 /// Build one child span per active slot in `enabled_slots` and return the updated
 /// `Context`, or `None` if no span was created.
 ///
+/// `site_key` is the site's registry key; it lands on every span as the
+/// [`TRACEABLE_KEY_ATTRIBUTE`] attribute.
 /// This leverages OpenTelemetry's `Context` threadl-local storage which uses
 /// RAII to guarantee the content of the context is always up to date and reflects
 /// the current state for the duration of a particular function call.
@@ -107,8 +112,12 @@ fn span_builder(name: &'static str, attrs: &[KeyValue]) -> SpanBuilder {
 pub fn start_spans(
     enabled_slots: u64,
     span_name: &'static str,
+    site_key: &'static str,
     attrs: Vec<KeyValue>,
 ) -> Option<Context> {
+    let mut attrs = attrs;
+    attrs.push(KeyValue::new(TRACEABLE_KEY_ATTRIBUTE, site_key));
+
     // we use `load_full` to avoid the arc-swap lock of `load` which would
     // be blocking for a `store` (i.e. a config reload)
     let slots = SLOTS.load_full();
