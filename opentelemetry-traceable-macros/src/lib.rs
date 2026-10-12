@@ -222,6 +222,7 @@ fn expand(args: TraceableArgs, func: ItemFn) -> TokenStream2 {
                 match ::opentelemetry_traceable::instrumentation::start_spans(
                     __traceable_mask,
                     #span_name,
+                    #registry_key,
                     ::std::vec![#(#kvs),*],
                 ) {
                     ::std::option::Option::None => #block,

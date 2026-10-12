@@ -179,6 +179,32 @@ fn enabling_emits_a_span_with_default_name() {
 }
 
 #[test]
+fn every_span_carries_the_site_registry_key() {
+    let (instr, exporter) = in_process_instr("A");
+    instr.enable(&[concat!(module_path!(), "::plain")]).unwrap();
+
+    let _ = plain(1);
+
+    let spans = exporter.get_finished_spans().unwrap();
+    assert_eq!(spans.len(), 1);
+    let key = spans[0]
+        .attributes
+        .iter()
+        .find(|kv| {
+            kv.key.as_str() == opentelemetry_traceable::instrumentation::TRACEABLE_KEY_ATTRIBUTE
+        })
+        .and_then(|kv| match &kv.value {
+            opentelemetry::Value::String(s) => Some(s.to_string()),
+            _ => None,
+        });
+    assert_eq!(
+        key.as_deref(),
+        Some(concat!(module_path!(), "::plain")),
+        "the registry key must land on the span so consumers can map it back"
+    );
+}
+
+#[test]
 fn custom_span_name_and_the_instrumentations_tracer_scope() {
     let (instr, exporter) = in_process_instr("test-tracer");
     instr.enable(&["custom.span"]).unwrap();
